@@ -1,0 +1,14 @@
+from typing import Optional
+from pydantic_settings import BaseSettings
+
+class AuthSettings(BaseSettings):
+    CONNECT_BASE_URL: str = "https://connect.bracu.ac.bd"
+    CONNECT_LOGIN_URL: str = "https://connect.bracu.ac.bd/login"
+    CONNECT_AUTH_INIT_URL: str = "https://connect.bracu.ac.bd/api/auth/init"
+    CONNECT_USER_INFO_URL: str = "https://connect.bracu.ac.bd/api/adv/v1/advising/student/info"
+    CONNECT_SCHEDULE_URL: str = "https://connect.bracu.ac.bd/api/adv/v1/advising/sections/student/{student_id}/schedules"
+    FRONTEND_URL: str = "http://localhost:5180"
+    BACKEND_URL: str = "http://localhost:8000"
+    SECRET_PASSWORD: str
+
+settings = AuthSettings() 
