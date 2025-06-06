@@ -115,11 +115,6 @@ async def shutdown_event():
 
 async def save_tokens(tokens):
     """Saves tokens to the PostgreSQL database."""
-    await create_db_pool() # Ensure pool is initialized
-    if not db_pool:
-        logger.error("Database pool not initialized after creation attempt.")
-        return False
-
     # If expires_in is present, store the expiry timestamp
     if "expires_in" in tokens:
         tokens["expires_at"] = int(time.time()) + int(tokens["expires_in"])
@@ -135,6 +130,13 @@ async def save_tokens(tokens):
         return False
 
     try:
+        # Try to acquire connection, if pool not ready, try creating it
+        if db_pool is None:
+            await create_db_pool()
+            if db_pool is None:
+                 logger.error("Database pool not initialized after creation attempt in save_tokens.")
+                 return False
+
         async with db_pool.acquire() as connection:
             # Use ON CONFLICT to handle both insert and update
             await connection.execute(
@@ -156,15 +158,17 @@ async def save_tokens(tokens):
 
 async def load_tokens():
     """Loads tokens for a fixed student ID from the PostgreSQL database."""
-    await create_db_pool() # Ensure pool is initialized
-    if not db_pool:
-        logger.error("Database pool not initialized after creation attempt.")
-        return None
-
     # Assuming a fixed student ID for now
     student_id = 42749
 
     try:
+        # Try to acquire connection, if pool not ready, try creating it
+        if db_pool is None:
+            await create_db_pool()
+            if db_pool is None:
+                logger.error("Database pool not initialized after creation attempt in load_tokens.")
+                return None
+
         async with db_pool.acquire() as connection:
             row = await connection.fetchrow(
                 "SELECT access_token, refresh_token, expires_at FROM user_tokens WHERE student_id = $1",
