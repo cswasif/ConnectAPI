@@ -17,6 +17,7 @@ import hashlib
 import base64
 import os
 import time
+import asyncpg
 
 # Development mode - set to False in production
 DEV_MODE = False
@@ -75,22 +76,109 @@ class ConnectPortalMiddleware(BaseHTTPMiddleware):
                 ).dict()
             )
 
+# Database connection pool
+DATABASE_URL = os.environ.get("DATABASE_URL")
+db_pool = None
+
+async def create_db_pool():
+    """Creates the database connection pool."""
+    global db_pool
+    if not DATABASE_URL:
+        logger.error("DATABASE_URL environment variable not set.")
+        return
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        logger.info("Database connection pool created.")
+    except Exception as e:
+        logger.error(f"Error creating database pool: {e}")
+
+async def close_db_pool():
+    """Closes the database connection pool."""
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        logger.info("Database connection pool closed.")
+
 app = FastAPI()
 
-token_file = "tokens.json"
+@app.on_event("startup")
+async def startup_event():
+    await create_db_pool()
 
-def save_tokens(tokens):
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_db_pool()
+
+async def save_tokens(tokens):
+    """Saves tokens to the PostgreSQL database."""
+    if not db_pool:
+        logger.error("Database pool not initialized.")
+        return False
+
     # If expires_in is present, store the expiry timestamp
     if "expires_in" in tokens:
         tokens["expires_at"] = int(time.time()) + int(tokens["expires_in"])
-    with open(token_file, "w") as f:
-        json.dump(tokens, f)
 
-def load_tokens():
-    if not os.path.exists(token_file):
+    # Assuming a fixed student ID for now
+    student_id = 42749
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    expires_at = tokens.get("expires_at")
+
+    if not all([access_token, refresh_token, expires_at is not None]):
+        logger.error("Missing required token data for saving.")
+        return False
+
+    try:
+        async with db_pool.acquire() as connection:
+            # Use ON CONFLICT to handle both insert and update
+            await connection.execute(
+                """
+                INSERT INTO user_tokens (student_id, access_token, refresh_token, expires_at)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (student_id) DO UPDATE
+                SET access_token = EXCLUDED.access_token,
+                    refresh_token = EXCLUDED.refresh_token,
+                    expires_at = EXCLUDED.expires_at
+                """,
+                student_id, access_token, refresh_token, expires_at
+            )
+        logger.info(f"Tokens saved/updated in database for student ID {student_id}.")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving tokens to database: {e}")
+        return False
+
+async def load_tokens():
+    """Loads tokens for a fixed student ID from the PostgreSQL database."""
+    if not db_pool:
+        logger.error("Database pool not initialized.")
         return None
-    with open(token_file, "r") as f:
-        return json.load(f)
+
+    # Assuming a fixed student ID for now
+    student_id = 42749
+
+    try:
+        async with db_pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT access_token, refresh_token, expires_at FROM user_tokens WHERE student_id = $1",
+                student_id
+            )
+
+        if row:
+            tokens = {
+                "access_token": row["access_token"],
+                "refresh_token": row["refresh_token"],
+                "expires_at": row["expires_at"]
+            }
+            logger.info(f"Tokens loaded from database for student ID {student_id}.")
+            return tokens
+        else:
+            logger.info(f"No tokens found in database for student ID {student_id}.")
+            return None
+    except Exception as e:
+        logger.error(f"Error loading tokens from database: {e}")
+        return None
 
 def is_token_expired(tokens, buffer=60):
     # buffer: seconds before expiry to refresh
@@ -229,13 +317,13 @@ async def raw_schedule(request: Request, access_token: str = None):
     try:
         tokens = None
         if not access_token:
-            tokens = load_tokens()
+            tokens = await load_tokens()
             if tokens and "access_token" in tokens:
                 # Auto-refresh if expired or about to expire
                 if is_token_expired(tokens):
                     if "refresh_token" in tokens:
                         new_tokens = await refresh_access_token(tokens["refresh_token"])
-                        save_tokens(new_tokens)
+                        await save_tokens(new_tokens)
                         tokens = new_tokens
                     else:
                         return '''<html><body><h2>Token expired and no refresh token found.</h2><p>Please <a href="/enter-tokens">enter your tokens</a> again.</p></body></html>'''
@@ -267,7 +355,7 @@ async def raw_schedule(request: Request, access_token: str = None):
 @app.get("/mytokens", response_class=HTMLResponse)
 async def view_tokens(request: Request):
     """View stored tokens (requires authentication)."""
-    tokens = load_tokens()
+    tokens = await load_tokens()
     if not tokens:
         return "<h2>No tokens stored. Please login and save your tokens first.</h2>"
     return f"<h2>Stored Tokens</h2><pre>{json.dumps(tokens, indent=2)}</pre>"
@@ -309,7 +397,7 @@ async def save_tokens_form(access_token: str = Form(...), refresh_token: str = F
         "access_token": access_token,
         "refresh_token": refresh_token
     }
-    save_tokens(tokens)
+    await save_tokens(tokens)
     return """
     <html>
         <body>

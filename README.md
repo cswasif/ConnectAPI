@@ -91,7 +91,7 @@ Base URL: `http://127.0.0.1:8000` (or your deployed URL)
 
 ### `POST /enter-tokens`
 
-*   **Description:** Receives the access and refresh tokens submitted via the `/enter-tokens` form and saves them to `tokens.json`.
+*   **Description:** Receives the access and refresh tokens submitted via the `/enter-tokens` form and saves them to the PostgreSQL database.
 *   **Parameters:**
     *   `access_token` (form data, required): Your BRACU Connect access token.
     *   `refresh_token` (form data, required): Your BRACU Connect refresh token.
@@ -99,29 +99,29 @@ Base URL: `http://127.0.0.1:8000` (or your deployed URL)
 
 ### `GET /mytokens`
 
-*   **Description:** Displays the currently stored access and refresh tokens from `tokens.json` in a raw JSON format.
-*   **Authentication:** Requires the `SECRET_PASSWORD` passed as a query parameter (`?password=your_password`). The root page's JavaScript handles adding this when using the button.
-*   **Response:** Raw JSON content of `tokens.json`, or an error message if no tokens are stored or authentication fails.
+*   **Description:** Displays the currently stored access and refresh tokens from the PostgreSQL database in a raw JSON format.
+*   **Authentication:** Requires the `SECRET_PASSWORD` passed as a query parameter (`?password=your_password`). The root page's JavaScript prompts for this and adds it when using the button.
+*   **Response:** Raw JSON content of the stored tokens, or an error message if no tokens are stored or authentication fails.
 
 ### `GET /raw-schedule`
 
 *   **Description:** Fetches and displays your raw class schedule data directly from the BRACU Connect API using a Bearer token.
 *   **Parameters:**
-    *   `access_token` (query parameter, optional): You can optionally provide an access token directly here (`?access_token=your_token`). If not provided, the API will attempt to load tokens from `tokens.json`.
-*   **Authentication:** Requires a valid Bearer access token. If the token loaded from `tokens.json` is expired, it will attempt to use the refresh token to get a new one and save it.
+    *   `access_token` (query parameter, optional): You can optionally provide an access token directly here (`?access_token=your_token`). If not provided, the API will attempt to load tokens from the database.
+*   **Authentication:** Requires a valid Bearer access token. If the token loaded from the database is expired, it will attempt to use the refresh token to get a new one and save it.
 *   **Response:** Raw JSON content of the schedule data, or an error message if fetching fails (e.g., invalid/expired token without a valid refresh token).
 
 ## Token Management
 
 1.  Obtain your BRACU Connect access and refresh tokens manually from your browser's developer tools after logging into the Connect portal.
-2.  Visit the root page (`/`) and click the "Enter Tokens" button. Enter your `SECRET_PASSWORD` when prompted.
+2.  Visit the root page (`/`) and click the "Enter Tokens" button. Enter your `SECRET_PASSWORD` when prompted by the browser. This will redirect you with the password in the URL query parameter.
 3.  On the "Enter Tokens" page, paste your access and refresh tokens into the respective fields and click "Save Tokens".
-4.  The API will now use these stored tokens to fetch your schedule via `/raw-schedule`. The API will attempt to auto-refresh the access token using the refresh token when it's close to expiring.
+4.  The API will now use these stored tokens from the PostgreSQL database to fetch your schedule via `/raw-schedule`. The API will attempt to auto-refresh the access token using the refresh token when it's close to expiring and update the tokens in the database.
 
 ## Security Notes and Limitations
 
 *   **Insecure Password in URL:** Passing the `SECRET_PASSWORD` as a query parameter (`?password=...`) is **highly insecure**. It can be easily exposed in server logs, browser history, and referrer headers. This method is used here for simplicity in a controlled, non-production environment only.
-*   **Insecure Token Storage:** Storing tokens in `tokens.json` is insecure for production. A database with encrypted fields is recommended.
+*   **Database Storage:** Tokens are now stored in a PostgreSQL database. While better than a flat file, ensure your database itself is secured.
 *   **Single User Focused:** The application is hardcoded for student ID 42749 and designed for a single user managing their own tokens. It is not built to securely handle multiple users.
 *   **No API User Authentication:** There is no authentication mechanism for users *of this API* other than the basic password for token management pages. The `/raw-schedule` endpoint is accessible if a valid token is available.
 *   **Limited Scalability:** The current architecture is not designed for high concurrency from thousands of users.
