@@ -85,12 +85,16 @@ async def create_db_pool():
     global db_pool
     if not DATABASE_URL:
         logger.error("DATABASE_URL environment variable not set.")
+        # In a serverless environment, returning here means no DB connection for this invocation.
+        # We might want to raise an exception or return an error response later if this happens.
         return
-    try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL)
-        logger.info("Database connection pool created.")
-    except Exception as e:
-        logger.error(f"Error creating database pool: {e}")
+    if db_pool is None:
+        try:
+            db_pool = await asyncpg.create_pool(DATABASE_URL)
+            logger.info("Database connection pool created.")
+        except Exception as e:
+            logger.error(f"Error creating database pool: {e}")
+            # Depending on severity, you might want to raise the exception
 
 async def close_db_pool():
     """Closes the database connection pool."""
@@ -111,8 +115,9 @@ async def shutdown_event():
 
 async def save_tokens(tokens):
     """Saves tokens to the PostgreSQL database."""
+    await create_db_pool() # Ensure pool is initialized
     if not db_pool:
-        logger.error("Database pool not initialized.")
+        logger.error("Database pool not initialized after creation attempt.")
         return False
 
     # If expires_in is present, store the expiry timestamp
@@ -151,8 +156,9 @@ async def save_tokens(tokens):
 
 async def load_tokens():
     """Loads tokens for a fixed student ID from the PostgreSQL database."""
+    await create_db_pool() # Ensure pool is initialized
     if not db_pool:
-        logger.error("Database pool not initialized.")
+        logger.error("Database pool not initialized after creation attempt.")
         return None
 
     # Assuming a fixed student ID for now
