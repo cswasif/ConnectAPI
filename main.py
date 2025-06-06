@@ -401,7 +401,8 @@ async def save_tokens_form(access_token: str = Form(...), refresh_token: str = F
     """Handle saving tokens."""
     tokens = {
         "access_token": access_token,
-        "refresh_token": refresh_token
+        "refresh_token": refresh_token,
+        "expires_at": 0 
     }
     await save_tokens(tokens)
     return """
