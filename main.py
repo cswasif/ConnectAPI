@@ -129,51 +129,63 @@ async def save_tokens(tokens):
         logger.error("Missing required token data for saving.")
         return False
 
+    connection = None # Initialize connection to None
     try:
-        # Try to acquire connection, if pool not ready, try creating it
+        # Ensure pool exists before acquiring connection
         if db_pool is None:
-            await create_db_pool()
-            if db_pool is None:
-                 logger.error("Database pool not initialized after creation attempt in save_tokens.")
+             await create_db_pool()
+             if db_pool is None:
+                 logger.error("Database pool not initialized before acquiring connection in save_tokens.")
                  return False
 
-        async with db_pool.acquire() as connection:
-            # Use ON CONFLICT to handle both insert and update
-            await connection.execute(
-                """
-                INSERT INTO user_tokens (student_id, access_token, refresh_token, expires_at)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (student_id) DO UPDATE
-                SET access_token = EXCLUDED.access_token,
-                    refresh_token = EXCLUDED.refresh_token,
-                    expires_at = EXCLUDED.expires_at
-                """,
-                student_id, access_token, refresh_token, expires_at
-            )
+        # Acquire connection safely within a try block
+        connection = await db_pool.acquire()
+
+        # Use the acquired connection
+        await connection.execute(
+            """
+            INSERT INTO user_tokens (student_id, access_token, refresh_token, expires_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (student_id) DO UPDATE
+            SET access_token = EXCLUDED.access_token,
+                refresh_token = EXCLUDED.refresh_token,
+                expires_at = EXCLUDED.expires_at
+            """,
+            student_id, access_token, refresh_token, expires_at
+        )
+
         logger.info(f"Tokens saved/updated in database for student ID {student_id}.")
         return True
     except Exception as e:
         logger.error(f"Error saving tokens to database: {e}")
         return False
+    finally:
+        # Release the connection in the finally block
+        if connection is not None and db_pool is not None:
+            await db_pool.release(connection)
 
 async def load_tokens():
     """Loads tokens for a fixed student ID from the PostgreSQL database."""
     # Assuming a fixed student ID for now
     student_id = 42749
 
+    connection = None # Initialize connection to None
     try:
-        # Try to acquire connection, if pool not ready, try creating it
+        # Ensure pool exists before acquiring connection
         if db_pool is None:
             await create_db_pool()
             if db_pool is None:
-                logger.error("Database pool not initialized after creation attempt in load_tokens.")
-                return None
+                 logger.error("Database pool not initialized before acquiring connection in load_tokens.")
+                 return None
 
-        async with db_pool.acquire() as connection:
-            row = await connection.fetchrow(
-                "SELECT access_token, refresh_token, expires_at FROM user_tokens WHERE student_id = $1",
-                student_id
-            )
+        # Acquire connection safely within a try block
+        connection = await db_pool.acquire()
+
+        # Use the acquired connection
+        row = await connection.fetchrow(
+            "SELECT access_token, refresh_token, expires_at FROM user_tokens WHERE student_id = $1",
+            student_id
+        )
 
         if row:
             tokens = {
@@ -189,6 +201,10 @@ async def load_tokens():
     except Exception as e:
         logger.error(f"Error loading tokens from database: {e}")
         return None
+    finally:
+        # Release the connection in the finally block
+        if connection is not None and db_pool is not None:
+            await db_pool.release(connection)
 
 def is_token_expired(tokens, buffer=60):
     # buffer: seconds before expiry to refresh
