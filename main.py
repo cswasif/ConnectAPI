@@ -48,6 +48,10 @@ class ErrorResponse(BaseModel):
     details: Optional[Dict[str, Any]] = None
     timestamp: str = datetime.now().isoformat()
 
+# Create FastAPI app first
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key="super-secret-session-key")
+
 # Upstash Redis config
 REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:AajsAAIjcDExN2MxMjVlNmRhMTc0ODI1OTlhMzRkZjY1MGFjZGJiNXAxMA@willing-husky-43244.upstash.io:6379"
 
@@ -73,9 +77,6 @@ async def shutdown_event():
     global redis_client
     if redis_client:
         await redis_client.close()
-
-app = FastAPI()
-app.add_middleware(SessionMiddleware, secret_key="super-secret-session-key")
 
 def decode_jwt_token(token: str) -> dict:
     """Decode a JWT token without verification to get expiration time."""
