@@ -131,6 +131,10 @@ Our deployment platform offering:
 - Edge Network
 - Zero configuration
 
+## Credits & Purpose
+
+This API server was developed by **Wasif Faisal** to support [Routinez](https://routinez.vercel.app/) and other BRACU student tools.
+
 ## License
 
 MIT License 

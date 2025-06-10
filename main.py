@@ -1,3 +1,8 @@
+# =============================================================
+# ConnectAPI - BRACU Connect API Server
+# Developed by Wasif Faisal to support https://routinez.vercel.app/
+# =============================================================
+
 from fastapi import FastAPI, Response, HTTPException, Header, Request, Cookie, status, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
@@ -408,6 +413,9 @@ async def root(request: Request):
     .session-id {{ font-size: 0.9em; color: #718096; margin-top: 18px; text-align: center; }}
     .network-uptime {{ font-size: 0.9em; color: #718096; margin-top: 8px; text-align: center; }}
     .token-remaining {{ font-size: 0.9em; color: #718096; margin-top: 4px; text-align: center; }}
+    .footer {{ font-size: 0.9em; color: #a0aec0; margin-top: 32px; text-align: center; }}
+    .footer a {{ color: #3182ce; text-decoration: none; }}
+    .footer a:hover {{ text-decoration: underline; }}
     </style></head><body>
     <div class='container'>
         <h1>BRACU Schedule Viewer</h1>
@@ -420,6 +428,7 @@ async def root(request: Request):
         <div class='session-id'>Session: {session_id}</div>
         <div class='network-uptime'>{network_uptime_display}</div>
         <div class='token-remaining'>{token_remaining_display}</div>
+        <div class='footer'>API server by <b>Wasif Faisal</b> to support <a href='https://routinez.vercel.app/' target='_blank'>Routinez</a></div>
     </div></body></html>
     """
     return HTMLResponse(html_content)
