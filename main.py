@@ -358,14 +358,22 @@ async def root(request: Request):
     if not session_id:
         session_id = secrets.token_urlsafe(16)
         request.session["id"] = session_id
-    # Calculate token uptime (remaining time)
+    # Calculate token uptimes
     token_uptime_display = "No active token."
+    token_remaining_display = "No active token."
     try:
         tokens = await load_tokens_from_redis(session_id)
+        now = int(time.time())
         if tokens and "expires_at" in tokens:
-            now = int(time.time())
-            remaining = max(0, tokens["expires_at"] - now)
-            days, remainder = divmod(remaining, 86400)
+            # --- Total uptime ---
+            activated_at = tokens.get("activated_at")
+            if not activated_at:
+                # If missing, set it now for backward compatibility
+                activated_at = now
+                tokens["activated_at"] = activated_at
+                await save_tokens_to_redis(session_id, tokens)
+            total_uptime = max(0, now - activated_at)
+            days, remainder = divmod(total_uptime, 86400)
             hours, remainder = divmod(remainder, 3600)
             minutes, seconds = divmod(remainder, 60)
             uptime_str = []
@@ -377,7 +385,22 @@ async def root(request: Request):
                 uptime_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
             if seconds or not uptime_str:
                 uptime_str.append(f"{seconds} second{'s' if seconds != 1 else ''}")
-            token_uptime_display = 'Token active for: ' + ', '.join(uptime_str)
+            token_uptime_display = 'Token total uptime: ' + ', '.join(uptime_str)
+            # --- Remaining time ---
+            remaining = max(0, tokens["expires_at"] - now)
+            days, remainder = divmod(remaining, 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            remaining_str = []
+            if days:
+                remaining_str.append(f"{days} day{'s' if days != 1 else ''}")
+            if hours:
+                remaining_str.append(f"{hours} hour{'s' if hours != 1 else ''}")
+            if minutes:
+                remaining_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+            if seconds or not remaining_str:
+                remaining_str.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+            token_remaining_display = 'Current token active for: ' + ', '.join(remaining_str)
     except Exception:
         pass
     html_content = f"""
@@ -393,6 +416,7 @@ async def root(request: Request):
     .session-id {{ font-size: 0.9em; color: #718096; margin-top: 18px; text-align: center; }}
     .uptime {{ font-size: 0.9em; color: #718096; margin-top: 8px; text-align: center; }}
     .token-uptime {{ font-size: 0.9em; color: #718096; margin-top: 8px; text-align: center; }}
+    .token-remaining {{ font-size: 0.9em; color: #718096; margin-top: 4px; text-align: center; }}
     </style></head><body>
     <div class='container'>
         <h1>BRACU Schedule Viewer</h1>
@@ -404,6 +428,7 @@ async def root(request: Request):
         </div>
         <div class='session-id'>Session: {session_id}</div>
         <div class='token-uptime'>{token_uptime_display}</div>
+        <div class='token-remaining'>{token_remaining_display}</div>
     </div></body></html>
     """
     return HTMLResponse(html_content)
