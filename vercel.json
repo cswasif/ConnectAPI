@@ -1,5 +1,6 @@
 {
     "version": 2,
+    "regions": ["sin1"],
     "builds": [
         {
             "src": "main.py",
@@ -11,5 +12,9 @@
             "src": "/(.*)",
             "dest": "main.py"
         }
-    ]
+    ],
+    "env": {
+        "PYTHONPATH": ".",
+        "REDIS_URL": "@redis_url"
+    }
 } 

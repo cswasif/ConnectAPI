@@ -6,8 +6,16 @@ A FastAPI-based API service for accessing BRACU (BRAC University) student schedu
 
 - Public schedule endpoint
 - Token management and auto-refresh
-- Redis-based caching
+- Upstash Redis for token storage and caching
 - Error handling and fallback mechanisms
+- Deployed on Vercel
+
+## Tech Stack
+
+- **Backend Framework**: FastAPI
+- **Database**: Upstash Redis (Serverless Redis)
+- **Deployment**: Vercel
+- **Runtime**: Python 3.7+
 
 ## Setup
 
@@ -24,21 +32,37 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Set up Redis:
-- Install Redis server
-- Make sure it's running on default port (6379)
+3. Set up Upstash Redis:
+- Go to [Upstash Console](https://console.upstash.com/)
+- Create a new Redis database
+- Copy the connection details
 
 4. Create a .env file with your configuration:
 ```env
+# Upstash Redis Configuration
+REDIS_URL=rediss://default:your-password@willing-husky-43244.upstash.io:6379
+
+# OAuth Configuration
 OAUTH_CLIENT_ID=your_client_id
 OAUTH_CLIENT_SECRET=your_client_secret
-REDIS_URL=redis://localhost:6379
 ```
 
-5. Run the server:
+5. Run the server locally:
 ```bash
 uvicorn main:app --reload
 ```
+
+## Deployment
+
+This project is configured for deployment on Vercel:
+
+1. Fork this repository
+2. Connect your fork to Vercel
+3. Add your environment variables in Vercel:
+   - `REDIS_URL` (from Upstash)
+   - `OAUTH_CLIENT_ID`
+   - `OAUTH_CLIENT_SECRET`
+4. Deploy!
 
 ## API Endpoints
 
@@ -48,14 +72,36 @@ Fetches the current schedule using the most recent valid token.
 - No authentication required
 - Returns schedule data in JSON format
 - Falls back to cached data if available
+- Uses Upstash Redis for token management and caching
 
 ## Dependencies
 
 - Python 3.7+
 - FastAPI
-- Redis
+- Upstash Redis
 - httpx
 - python-jose[cryptography]
+
+## Infrastructure
+
+### Upstash Redis
+We use Upstash Redis as our primary database for:
+- Token storage and management
+- Schedule data caching
+- Session handling
+
+Benefits of using Upstash:
+- Serverless Redis solution
+- Global data replication
+- Pay-per-use pricing
+- Built-in REST API
+
+### Vercel
+Our deployment platform offering:
+- Serverless Functions
+- Automatic deployments
+- Edge Network
+- Zero configuration
 
 ## License
 
