@@ -50,7 +50,29 @@ class ErrorResponse(BaseModel):
 
 # Upstash Redis config
 REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:AajsAAIjcDExN2MxMjVlNmRhMTc0ODI1OTlhMzRkZjY1MGFjZGJiNXAxMA@willing-husky-43244.upstash.io:6379"
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+# Initialize Redis client as None, will be created per request
+redis_client = None
+
+async def get_redis():
+    """Get or create Redis client."""
+    global redis_client
+    if redis_client is None:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    return redis_client
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize Redis connection on startup."""
+    global redis_client
+    redis_client = await get_redis()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close Redis connection on shutdown."""
+    global redis_client
+    if redis_client:
+        await redis_client.close()
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="super-secret-session-key")
@@ -78,70 +100,100 @@ def decode_jwt_token(token: str) -> dict:
 
 async def save_tokens_to_redis(session_id, tokens):
     """Save tokens to Redis with proper expiration time from JWT."""
-    now = int(time.time())
-    
-    # Get expiration from JWT if we have an access token
-    if "access_token" in tokens:
-        jwt_data = decode_jwt_token(tokens["access_token"])
-        if "exp" in jwt_data:
-            tokens["expires_at"] = jwt_data["exp"]
-            tokens["expires_in"] = max(0, jwt_data["exp"] - now)  # Calculate expires_in from JWT exp
-            logger.info(f"Got token expiration from JWT: {tokens['expires_in']} seconds remaining")
-        else:
-            # Fallback to default 5 minutes if no exp in JWT
-            tokens["expires_at"] = now + 300
-            tokens["expires_in"] = 300
-            logger.warning("No expiration found in JWT, using default 5 minutes")
-    
-    # Always set refresh token expiration to 30 minutes from now if we have a refresh token
-    if "refresh_token" in tokens:
-        tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes
-    
-    await redis_client.set(f"tokens:{session_id}", json.dumps(tokens))
-    logger.info(f"Tokens saved in Redis. Access token expires in {tokens.get('expires_in', 0)}s, "
-                f"refresh token expires in {tokens.get('refresh_expires_at', 0) - now}s")
-    return True
+    try:
+        redis_conn = await get_redis()
+        now = int(time.time())
+        
+        # Get expiration from JWT if we have an access token
+        if "access_token" in tokens:
+            jwt_data = decode_jwt_token(tokens["access_token"])
+            if "exp" in jwt_data:
+                tokens["expires_at"] = jwt_data["exp"]
+                tokens["expires_in"] = max(0, jwt_data["exp"] - now)  # Calculate expires_in from JWT exp
+                logger.info(f"Got token expiration from JWT: {tokens['expires_in']} seconds remaining")
+            else:
+                # Fallback to default 5 minutes if no exp in JWT
+                tokens["expires_at"] = now + 300
+                tokens["expires_in"] = 300
+                logger.warning("No expiration found in JWT, using default 5 minutes")
+        
+        # Always set refresh token expiration to 30 minutes from now if we have a refresh token
+        if "refresh_token" in tokens:
+            tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes
+        
+        await redis_conn.set(f"tokens:{session_id}", json.dumps(tokens))
+        logger.info(f"Tokens saved in Redis. Access token expires in {tokens.get('expires_in', 0)}s, "
+                    f"refresh token expires in {tokens.get('refresh_expires_at', 0) - now}s")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving tokens to Redis: {str(e)}")
+        raise
 
 async def load_tokens_from_redis(session_id):
-    data = await redis_client.get(f"tokens:{session_id}")
-    if data:
-        tokens = json.loads(data)
-        logger.info(f"Tokens loaded from Redis for session {session_id}.")
-        return tokens
-    else:
-        logger.info(f"No tokens found in Redis for session {session_id}.")
+    try:
+        redis_conn = await get_redis()
+        data = await redis_conn.get(f"tokens:{session_id}")
+        if data:
+            tokens = json.loads(data)
+            logger.info(f"Tokens loaded from Redis for session {session_id}.")
+            return tokens
+        else:
+            logger.info(f"No tokens found in Redis for session {session_id}.")
+            return None
+    except Exception as e:
+        logger.error(f"Error loading tokens from Redis: {str(e)}")
         return None
 
 async def save_global_student_tokens(student_id, tokens):
-    if "expires_in" in tokens:
-        tokens["expires_at"] = int(time.time()) + int(tokens["expires_in"])
-    await redis_client.set(f"student_tokens:{student_id}", json.dumps(tokens))
-    logger.info(f"Global tokens updated for student_id {student_id}.")
-    return True
+    try:
+        redis_conn = await get_redis()
+        if "expires_in" in tokens:
+            tokens["expires_at"] = int(time.time()) + int(tokens["expires_in"])
+        await redis_conn.set(f"student_tokens:{student_id}", json.dumps(tokens))
+        logger.info(f"Global tokens updated for student_id {student_id}.")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving global student tokens to Redis: {str(e)}")
+        raise
 
 async def load_global_student_tokens(student_id):
-    data = await redis_client.get(f"student_tokens:{student_id}")
-    if data:
-        tokens = json.loads(data)
-        logger.info(f"Global tokens loaded for student_id {student_id}.")
-        return tokens
-    else:
-        logger.info(f"No global tokens found for student_id {student_id}.")
+    try:
+        redis_conn = await get_redis()
+        data = await redis_conn.get(f"student_tokens:{student_id}")
+        if data:
+            tokens = json.loads(data)
+            logger.info(f"Global tokens loaded for student_id {student_id}.")
+            return tokens
+        else:
+            logger.info(f"No global tokens found for student_id {student_id}.")
+            return None
+    except Exception as e:
+        logger.error(f"Error loading global student tokens from Redis: {str(e)}")
         return None
 
 async def save_student_schedule(student_id, schedule):
-    await redis_client.set(f"student_schedule:{student_id}", json.dumps(schedule))
-    logger.info(f"Schedule cached for student_id {student_id} (no expiration).")
-    return True
+    try:
+        redis_conn = await get_redis()
+        await redis_conn.set(f"student_schedule:{student_id}", json.dumps(schedule))
+        logger.info(f"Schedule cached for student_id {student_id} (no expiration).")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving student schedule to Redis: {str(e)}")
+        raise
 
 async def load_student_schedule(student_id):
-    data = await redis_client.get(f"student_schedule:{student_id}")
-    if data:
-        schedule = json.loads(data)
-        logger.info(f"Schedule loaded from cache for student_id {student_id}.")
-        return schedule
-    else:
-        logger.info(f"No cached schedule found for student_id {student_id}.")
+    try:
+        redis_conn = await get_redis()
+        data = await redis_conn.get(f"student_schedule:{student_id}")
+        if data:
+            schedule = json.loads(data)
+            logger.info(f"Schedule loaded from cache for student_id {student_id}.")
+            return schedule
+        else:
+            logger.info(f"No cached schedule found for student_id {student_id}.")
+            return None
+    except Exception as e:
+        logger.error(f"Error loading student schedule from Redis: {str(e)}")
         return None
 
 def get_basic_auth_header():
