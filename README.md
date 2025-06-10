@@ -9,6 +9,7 @@ A FastAPI-based API service for accessing BRACU (BRAC University) student schedu
 - Upstash Redis for token storage and caching
 - Error handling and fallback mechanisms
 - Deployed on Vercel
+- **Session-based security for sensitive endpoints**: Only users with a valid session can access `/enter-tokens` and `/mytokens`. The `/raw-schedule` endpoint remains public.
 
 ## Tech Stack
 
@@ -73,6 +74,19 @@ Fetches the current schedule using the most recent valid token.
 - Returns schedule data in JSON format
 - Falls back to cached data if available
 - Uses Upstash Redis for token management and caching
+
+### GET/POST /enter-tokens
+Allows users to enter and save their access and refresh tokens.
+
+- **Requires a valid session** (users must start from the home page to get a session)
+- Tokens are stored securely in Redis, scoped to the session
+- Not accessible to the public without a session
+
+### GET /mytokens
+View the tokens associated with the current session.
+
+- **Requires a valid session**
+- Not accessible to the public without a session
 
 ## Dependencies
 
