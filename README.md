@@ -72,8 +72,13 @@ Fetches the current schedule using the most recent valid token.
 
 - No authentication required
 - Returns schedule data in JSON format
-- Falls back to cached data if available
 - Uses Upstash Redis for token management and caching
+- **How it works:**
+  - The endpoint always tries to fetch the latest real schedule from the Connect API using the most recent valid token.
+  - If the live API call is successful, it updates the cache and returns the fresh data.
+  - If the live API call fails (e.g., network error, token expired), it falls back to the most recently cached schedule (if available).
+  - If no valid token or cached schedule exists, an error is returned.
+- **Everyone sees the same schedule**—it is not user-specific.
 
 ### GET/POST /enter-tokens
 Allows users to enter and save their access and refresh tokens.
