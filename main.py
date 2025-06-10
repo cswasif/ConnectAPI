@@ -358,35 +358,27 @@ async def root(request: Request):
     if not session_id:
         session_id = secrets.token_urlsafe(16)
         request.session["id"] = session_id
-    # Calculate token uptimes
-    token_uptime_display = "No active token."
+    # Calculate network uptime (server process uptime)
+    network_uptime_seconds = int(time.time() - start_time)
+    days, remainder = divmod(network_uptime_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    network_uptime_str = []
+    if days:
+        network_uptime_str.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        network_uptime_str.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes:
+        network_uptime_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if seconds or not network_uptime_str:
+        network_uptime_str.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+    network_uptime_display = 'Network uptime: ' + ', '.join(network_uptime_str)
+    # Calculate token remaining time
     token_remaining_display = "No active token."
     try:
         tokens = await load_tokens_from_redis(session_id)
         now = int(time.time())
         if tokens and "expires_at" in tokens:
-            # --- Total uptime ---
-            activated_at = tokens.get("activated_at")
-            if not activated_at:
-                # If missing, set it now for backward compatibility
-                activated_at = now
-                tokens["activated_at"] = activated_at
-                await save_tokens_to_redis(session_id, tokens)
-            total_uptime = max(0, now - activated_at)
-            days, remainder = divmod(total_uptime, 86400)
-            hours, remainder = divmod(remainder, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            uptime_str = []
-            if days:
-                uptime_str.append(f"{days} day{'s' if days != 1 else ''}")
-            if hours:
-                uptime_str.append(f"{hours} hour{'s' if hours != 1 else ''}")
-            if minutes:
-                uptime_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-            if seconds or not uptime_str:
-                uptime_str.append(f"{seconds} second{'s' if seconds != 1 else ''}")
-            token_uptime_display = 'Token total uptime: ' + ', '.join(uptime_str)
-            # --- Remaining time ---
             remaining = max(0, tokens["expires_at"] - now)
             days, remainder = divmod(remaining, 86400)
             hours, remainder = divmod(remainder, 3600)
@@ -414,8 +406,7 @@ async def root(request: Request):
     .button {{ background: #3182ce; color: #fff; border: none; border-radius: 6px; padding: 10px 22px; font-size: 1rem; cursor: pointer; text-decoration: none; transition: background 0.2s; }}
     .button:hover {{ background: #225ea8; }}
     .session-id {{ font-size: 0.9em; color: #718096; margin-top: 18px; text-align: center; }}
-    .uptime {{ font-size: 0.9em; color: #718096; margin-top: 8px; text-align: center; }}
-    .token-uptime {{ font-size: 0.9em; color: #718096; margin-top: 8px; text-align: center; }}
+    .network-uptime {{ font-size: 0.9em; color: #718096; margin-top: 8px; text-align: center; }}
     .token-remaining {{ font-size: 0.9em; color: #718096; margin-top: 4px; text-align: center; }}
     </style></head><body>
     <div class='container'>
@@ -427,7 +418,7 @@ async def root(request: Request):
             <a class='button' href='/raw-schedule'>View Raw Schedule</a>
         </div>
         <div class='session-id'>Session: {session_id}</div>
-        <div class='token-uptime'>{token_uptime_display}</div>
+        <div class='network-uptime'>{network_uptime_display}</div>
         <div class='token-remaining'>{token_remaining_display}</div>
     </div></body></html>
     """
