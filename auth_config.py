@@ -9,6 +9,6 @@ class AuthSettings(BaseSettings):
     CONNECT_SCHEDULE_URL: str = "https://connect.bracu.ac.bd/api/adv/v1/advising/sections/student/{student_id}/schedules"
     FRONTEND_URL: str = "http://localhost:5180"
     BACKEND_URL: str = "http://localhost:8000"
-    SECRET_PASSWORD: str
+    SECRET_PASSWORD: str = "default-not-used"
 
 settings = AuthSettings() 
