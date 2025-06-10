@@ -6,8 +6,7 @@ from typing import Optional, Dict, Any
 from pydantic import BaseModel
 import secrets
 from urllib.parse import urlencode, urlparse
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
+from starlette.middleware.sessions import SessionMiddleware
 from auth_config import settings
 import logging
 import traceback
@@ -17,7 +16,17 @@ import hashlib
 import base64
 import os
 import time
-import asyncpg
+import redis.asyncio as redis
+import jwt
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Get OAuth2 credentials from environment variables
+OAUTH_CLIENT_ID = os.getenv('OAUTH_CLIENT_ID', 'connect-portal')
+OAUTH_CLIENT_SECRET = os.getenv('OAUTH_CLIENT_SECRET', '')
+OAUTH_TOKEN_URL = os.getenv('OAUTH_TOKEN_URL', 'https://sso.bracu.ac.bd/realms/bracu/protocol/openid-connect/token')
 
 # Development mode - set to False in production
 DEV_MODE = False
@@ -39,400 +48,494 @@ class ErrorResponse(BaseModel):
     details: Optional[Dict[str, Any]] = None
     timestamp: str = datetime.now().isoformat()
 
-# Paths that require password
-password_protected_paths = ["/enter-tokens", "/mytokens"]
-
-class ConnectPortalMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
-        logger.debug(f"Incoming request path: {path}")
-
-        # Check for password protection
-        if path in password_protected_paths:
-            password = request.query_params.get("password")
-            if not password or password != settings.SECRET_PASSWORD:
-                logger.warning(f"Unauthorized access attempt to {path}")
-                return JSONResponse(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    content=ErrorResponse(
-                        error="Authentication failed",
-                        error_code="PASSWORD_REQUIRED",
-                        details={"message": "Password required to access this endpoint."} if DEV_MODE else None
-                    ).dict()
-                )
-
-        try:
-            return await call_next(request)
-
-        except Exception as e:
-            logger.error(f"Error in middleware: {str(e)}")
-            logger.debug(traceback.format_exc())
-            return JSONResponse(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                content=ErrorResponse(
-                    error="Internal server error",
-                    error_code="MIDDLEWARE_ERROR",
-                    details={"message": str(e)} if DEV_MODE else None
-                ).dict()
-            )
-
-# Database connection pool
-DATABASE_URL = os.environ.get("DATABASE_URL")
-db_pool = None
-
-async def create_db_pool():
-    """Creates the database connection pool."""
-    global db_pool
-    if not DATABASE_URL:
-        logger.error("DATABASE_URL environment variable not set.")
-        # In a serverless environment, returning here means no DB connection for this invocation.
-        # We might want to raise an exception or return an error response later if this happens.
-        return
-    if db_pool is None:
-        try:
-            db_pool = await asyncpg.create_pool(DATABASE_URL)
-            logger.info("Database connection pool created.")
-        except Exception as e:
-            logger.error(f"Error creating database pool: {e}")
-            # Depending on severity, you might want to raise the exception
-
-async def close_db_pool():
-    """Closes the database connection pool."""
-    global db_pool
-    if db_pool:
-        await db_pool.close()
-        logger.info("Database connection pool closed.")
+# Upstash Redis config
+REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:AajsAAIjcDExN2MxMjVlNmRhMTc0ODI1OTlhMzRkZjY1MGFjZGJiNXAxMA@willing-husky-43244.upstash.io:6379"
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key="super-secret-session-key")
 
-@app.on_event("startup")
-async def startup_event():
-    await create_db_pool()
+def decode_jwt_token(token: str) -> dict:
+    """Decode a JWT token without verification to get expiration time."""
+    try:
+        # Split the token and get the payload part (second part)
+        parts = token.split('.')
+        if len(parts) != 3:
+            logger.error("Invalid JWT token format")
+            return {}
+        
+        # Decode the payload
+        # Add padding if needed
+        padding = len(parts[1]) % 4
+        if padding:
+            parts[1] += '=' * (4 - padding)
+        
+        payload = json.loads(base64.b64decode(parts[1]).decode('utf-8'))
+        return payload
+    except Exception as e:
+        logger.error(f"Error decoding JWT token: {str(e)}")
+        return {}
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await close_db_pool()
+async def save_tokens_to_redis(session_id, tokens):
+    """Save tokens to Redis with proper expiration time from JWT."""
+    now = int(time.time())
+    
+    # Get expiration from JWT if we have an access token
+    if "access_token" in tokens:
+        jwt_data = decode_jwt_token(tokens["access_token"])
+        if "exp" in jwt_data:
+            tokens["expires_at"] = jwt_data["exp"]
+            tokens["expires_in"] = max(0, jwt_data["exp"] - now)  # Calculate expires_in from JWT exp
+            logger.info(f"Got token expiration from JWT: {tokens['expires_in']} seconds remaining")
+        else:
+            # Fallback to default 5 minutes if no exp in JWT
+            tokens["expires_at"] = now + 300
+            tokens["expires_in"] = 300
+            logger.warning("No expiration found in JWT, using default 5 minutes")
+    
+    # Always set refresh token expiration to 30 minutes from now if we have a refresh token
+    if "refresh_token" in tokens:
+        tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes
+    
+    await redis_client.set(f"tokens:{session_id}", json.dumps(tokens))
+    logger.info(f"Tokens saved in Redis. Access token expires in {tokens.get('expires_in', 0)}s, "
+                f"refresh token expires in {tokens.get('refresh_expires_at', 0) - now}s")
+    return True
 
-async def save_tokens(tokens):
-    """Saves tokens to the PostgreSQL database."""
-    # If expires_in is present, store the expiry timestamp
+async def load_tokens_from_redis(session_id):
+    data = await redis_client.get(f"tokens:{session_id}")
+    if data:
+        tokens = json.loads(data)
+        logger.info(f"Tokens loaded from Redis for session {session_id}.")
+        return tokens
+    else:
+        logger.info(f"No tokens found in Redis for session {session_id}.")
+        return None
+
+async def save_global_student_tokens(student_id, tokens):
     if "expires_in" in tokens:
         tokens["expires_at"] = int(time.time()) + int(tokens["expires_in"])
+    await redis_client.set(f"student_tokens:{student_id}", json.dumps(tokens))
+    logger.info(f"Global tokens updated for student_id {student_id}.")
+    return True
 
-    # Assuming a fixed student ID for now
-    student_id = 42749
-    access_token = tokens.get("access_token")
-    refresh_token = tokens.get("refresh_token")
-    expires_at = tokens.get("expires_at")
-
-    if not all([access_token, refresh_token, expires_at is not None]):
-        logger.error("Missing required token data for saving.")
-        return False
-
-    connection = None # Initialize connection to None
-    try:
-        # Ensure pool exists before acquiring connection
-        if db_pool is None:
-             await create_db_pool()
-             if db_pool is None:
-                 logger.error("Database pool not initialized before acquiring connection in save_tokens.")
-                 return False
-
-        # Acquire connection safely within a try block
-        connection = await db_pool.acquire()
-
-        # Use the acquired connection
-        await connection.execute(
-            """
-            INSERT INTO user_tokens (student_id, access_token, refresh_token, expires_at)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (student_id) DO UPDATE
-            SET access_token = EXCLUDED.access_token,
-                refresh_token = EXCLUDED.refresh_token,
-                expires_at = EXCLUDED.expires_at
-            """,
-            student_id, access_token, refresh_token, expires_at
-        )
-
-        logger.info(f"Tokens saved/updated in database for student ID {student_id}.")
-        return True
-    except Exception as e:
-        logger.error(f"Error saving tokens to database: {e}")
-        return False
-    finally:
-        # Release the connection in the finally block
-        if connection is not None and db_pool is not None:
-            await db_pool.release(connection)
-
-async def load_tokens():
-    """Loads tokens for a fixed student ID from the PostgreSQL database."""
-    # Assuming a fixed student ID for now
-    student_id = 42749
-
-    connection = None # Initialize connection to None
-    try:
-        # Ensure pool exists before acquiring connection
-        if db_pool is None:
-            await create_db_pool()
-            if db_pool is None:
-                 logger.error("Database pool not initialized before acquiring connection in load_tokens.")
-                 return None
-
-        # Acquire connection safely within a try block
-        connection = await db_pool.acquire()
-
-        # Use the acquired connection
-        row = await connection.fetchrow(
-            "SELECT access_token, refresh_token, expires_at FROM user_tokens WHERE student_id = $1",
-            student_id
-        )
-
-        if row:
-            tokens = {
-                "access_token": row["access_token"],
-                "refresh_token": row["refresh_token"],
-                "expires_at": row["expires_at"]
-            }
-            logger.info(f"Tokens loaded from database for student ID {student_id}.")
-            return tokens
-        else:
-            logger.info(f"No tokens found in database for student ID {student_id}.")
-            return None
-    except Exception as e:
-        logger.error(f"Error loading tokens from database: {e}")
+async def load_global_student_tokens(student_id):
+    data = await redis_client.get(f"student_tokens:{student_id}")
+    if data:
+        tokens = json.loads(data)
+        logger.info(f"Global tokens loaded for student_id {student_id}.")
+        return tokens
+    else:
+        logger.info(f"No global tokens found for student_id {student_id}.")
         return None
-    finally:
-        # Release the connection in the finally block
-        if connection is not None and db_pool is not None:
-            await db_pool.release(connection)
+
+async def save_student_schedule(student_id, schedule):
+    await redis_client.set(f"student_schedule:{student_id}", json.dumps(schedule))
+    logger.info(f"Schedule cached for student_id {student_id} (no expiration).")
+    return True
+
+async def load_student_schedule(student_id):
+    data = await redis_client.get(f"student_schedule:{student_id}")
+    if data:
+        schedule = json.loads(data)
+        logger.info(f"Schedule loaded from cache for student_id {student_id}.")
+        return schedule
+    else:
+        logger.info(f"No cached schedule found for student_id {student_id}.")
+        return None
+
+def get_basic_auth_header():
+    """Generate Basic Auth header from environment variables."""
+    if not OAUTH_CLIENT_SECRET:
+        logger.warning("OAuth client secret not configured! Token refresh may fail.")
+    
+    credentials = f"{OAUTH_CLIENT_ID}:{OAUTH_CLIENT_SECRET}"
+    encoded = base64.b64encode(credentials.encode()).decode()
+    return f"Basic {encoded}"
+
+async def refresh_access_token(refresh_token: str) -> dict:
+    """Refresh the access token using the refresh token."""
+    token_url = "https://sso.bracu.ac.bd/realms/bracu/protocol/openid-connect/token"
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": "slm",  # Using the working client_id from old implementation
+        "refresh_token": refresh_token,
+    }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            logger.debug(f"Trying token refresh at: {token_url}")
+            resp = await client.post(token_url, data=data, timeout=10.0)
+            logger.debug(f"Token refresh response: {resp.status_code} {resp.text}")
+            
+            if resp.status_code == 200:
+                try:
+                    new_tokens = resp.json()
+                    if isinstance(new_tokens, dict) and "access_token" in new_tokens:
+                        logger.info("Successfully refreshed access token")
+                        now = int(time.time())
+                        
+                        # Get expiration from new access token
+                        access_jwt_data = decode_jwt_token(new_tokens["access_token"])
+                        if "exp" in access_jwt_data:
+                            new_tokens["expires_at"] = access_jwt_data["exp"]
+                            new_tokens["expires_in"] = max(0, access_jwt_data["exp"] - now)
+                        
+                        # If we got a new refresh token, get its expiration
+                        if "refresh_token" in new_tokens:
+                            refresh_jwt_data = decode_jwt_token(new_tokens["refresh_token"])
+                            if "exp" in refresh_jwt_data:
+                                new_tokens["refresh_expires_at"] = refresh_jwt_data["exp"]
+                            else:
+                                new_tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes default
+                        else:
+                            # Keep the old refresh token if we didn't get a new one
+                            new_tokens["refresh_token"] = refresh_token
+                            refresh_jwt_data = decode_jwt_token(refresh_token)
+                            if "exp" in refresh_jwt_data:
+                                new_tokens["refresh_expires_at"] = refresh_jwt_data["exp"]
+                            else:
+                                new_tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes default
+                        
+                        logger.info(f"New tokens: Access expires in {new_tokens.get('expires_in')}s, "
+                                  f"Refresh expires in {new_tokens.get('refresh_expires_at', 0) - now}s")
+                        return new_tokens
+                    else:
+                        logger.error(f"Invalid token refresh response format")
+                        return None
+                except Exception as e:
+                    logger.error(f"Failed to parse token refresh response: {str(e)}")
+                    return None
+            elif resp.status_code == 401:
+                logger.error("Refresh token has expired or is invalid")
+                return None
+            else:
+                logger.error(f"Failed to refresh token: {resp.status_code} {resp.text}")
+                return None
+    except Exception as e:
+        logger.error(f"Error refreshing token: {str(e)}")
+        return None
 
 def is_token_expired(tokens, buffer=60):
+    """Check if the token is expired or will expire soon."""
     # buffer: seconds before expiry to refresh
     if not tokens or "expires_at" not in tokens:
         return True
     return int(time.time()) > int(tokens["expires_at"]) - buffer
 
-async def refresh_access_token(refresh_token):
-    token_url = "https://sso.bracu.ac.bd/realms/bracu/protocol/openid-connect/token"
-    data = {
-        "grant_type": "refresh_token",
-        "client_id": "slm",
-        "refresh_token": refresh_token,
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(token_url, data=data)
-        if resp.status_code == 200:
-            return resp.json()
+async def ensure_valid_token(session_id: str, tokens: dict) -> tuple[str, dict]:
+    """Ensure we have a valid access token, refreshing if necessary."""
+    if not tokens:
+        logger.error("No tokens provided")
+        return None, tokens
+        
+    # Check if token is expired or will expire soon
+    if is_token_expired(tokens):
+        if "refresh_token" in tokens:
+            logger.info("Access token expired or expiring soon, attempting refresh")
+            new_tokens = await refresh_access_token(tokens["refresh_token"])
+            if new_tokens:
+                # Save the new tokens immediately
+                await save_tokens_to_redis(session_id, new_tokens)
+                logger.info("Successfully refreshed and saved new tokens")
+                return new_tokens.get("access_token"), new_tokens
+            else:
+                logger.error("Token refresh failed")
+                return None, tokens
         else:
-            return f"<pre>Failed to refresh token: {resp.text}</pre>"
+            logger.error("No refresh token available")
+            return None, tokens
+            
+    return tokens.get("access_token"), tokens
 
 @app.get("/", response_class=HTMLResponse)
-async def root():
-    """Show API status and navigation links"""
-    # Calculate uptime
-    current_time = time.time()
-    uptime_seconds = int(current_time - start_time)
-
-    # Format uptime
-    hours, remainder = divmod(uptime_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    uptime_str = f"Uptime: {hours}h {minutes}m {seconds}s"
-
+async def root(request: Request):
+    session_id = request.session.get("id")
+    if not session_id:
+        session_id = secrets.token_urlsafe(16)
+        request.session["id"] = session_id
     html_content = f"""
-    <html>
-        <head>
-            <title>BRACU Schedule Viewer API</title>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    margin: 0;
-                    padding: 0;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    min-height: 100vh;
-                    background-color: #f5f5f5;
-                }}
-                .container {{
-                    background-color: white;
-                    padding: 40px;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                    text-align: center;
-                }}
-                h1 {{
-                    color: #333;
-                    margin-bottom: 20px;
-                }}
-                .button-container {{
-                    margin-top: 20px;
-                }}
-                .button {{
-                    display: inline-block;
-                    padding: 12px 24px;
-                    margin: 5px;
-                    background-color: #007bff;
-                    color: white;
-                    text-decoration: none;
-                    border-radius: 5px;
-                    font-weight: bold;
-                    transition: background-color 0.2s;
-                }}
-                .button:hover {{
-                    background-color: #0056b3;
-                }}
-                .status {{
-                    margin-top: 20px;
-                    color: #555;
-                    font-size: 0.9em;
-                }}
-                 .uptime-status {{
-                    margin-top: 10px;
-                    color: #555;
-                    font-size: 0.9em;
-                 }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>BRACU Schedule Viewer API</h1>
-                <p>Your local API server is running.</p>
-                <div class="button-container">
-                    <a href="/enter-tokens" class="button">Enter Tokens</a>
-                    <a href="/raw-schedule" class="button">View Schedule</a>
-                    <a href="/mytokens" class="button">View Stored Tokens</a>
-                </div>
-                 <p class="status">API Status: Active</p>
-                 <p class="uptime-status">{uptime_str}</p>
-            </div>
-            <script>
-                document.addEventListener('DOMContentLoaded', function() {{
-                    const enterTokensLink = document.querySelector('a[href="/enter-tokens"]');
-                    const viewTokensLink = document.querySelector('a[href="/mytokens"]');
-
-                    if (enterTokensLink) {{
-                        enterTokensLink.addEventListener('click', function(event) {{
-                            event.preventDefault();
-                            const password = prompt('Please enter the password:');
-                            if (password !== null && password !== '') {{
-                                window.location.href = '/enter-tokens?password=' + encodeURIComponent(password);
-                            }}
-                        }});
-                    }}
-
-                    if (viewTokensLink) {{
-                        viewTokensLink.addEventListener('click', function(event) {{
-                            event.preventDefault();
-                            const password = prompt('Please enter the password:');
-                            if (password !== null && password !== '') {{
-                                window.location.href = '/mytokens?password=' + encodeURIComponent(password);
-                            }}
-                        }});
-                    }}
-                }});
-            </script>
-        </body>
-    </html>
+    <html><head><title>BRACU Schedule Viewer</title>
+    <style>
+    body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }}
+    .container {{ max-width: 480px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 40px 32px; }}
+    h1 {{ color: #2d3748; margin-bottom: 12px; }}
+    .desc {{ color: #4a5568; margin-bottom: 24px; }}
+    .button-container {{ display: flex; gap: 12px; justify-content: center; margin-bottom: 24px; }}
+    .button {{ background: #3182ce; color: #fff; border: none; border-radius: 6px; padding: 10px 22px; font-size: 1rem; cursor: pointer; text-decoration: none; transition: background 0.2s; }}
+    .button:hover {{ background: #225ea8; }}
+    .session-id {{ font-size: 0.9em; color: #718096; margin-top: 18px; text-align: center; }}
+    </style></head><body>
+    <div class='container'>
+        <h1>BRACU Schedule Viewer</h1>
+        <div class='desc'>A simple client to view your BRACU Connect schedule.<br>Session-based, no password required.</div>
+        <div class='button-container'>
+            <a class='button' href='/enter-tokens'>Enter Tokens</a>
+            <a class='button' href='/mytokens'>View Tokens</a>
+            <a class='button' href='/raw-schedule'>View Raw Schedule</a>
+        </div>
+        <div class='session-id'>Session: {session_id}</div>
+    </div></body></html>
     """
-
-    return HTMLResponse(content=html_content)
-
-@app.get("/raw-schedule", response_class=HTMLResponse)
-async def raw_schedule(request: Request, access_token: str = None):
-    """Display raw schedule JSON data using a Bearer access_token, auto-refresh if expired."""
-    try:
-        tokens = None
-        if not access_token:
-            tokens = await load_tokens()
-            if tokens and "access_token" in tokens:
-                # Auto-refresh if expired or about to expire
-                if is_token_expired(tokens):
-                    if "refresh_token" in tokens:
-                        new_tokens = await refresh_access_token(tokens["refresh_token"])
-                        await save_tokens(new_tokens)
-                        tokens = new_tokens
-                    else:
-                        return '''<html><body><h2>Token expired and no refresh token found.</h2><p>Please <a href="/enter-tokens">enter your tokens</a> again.</p></body></html>'''
-                access_token = tokens["access_token"]
-            else:
-                return '''
-                <html>
-                    <head><title>Provide Access Token</title></head>
-                    <body>
-                        <h2>No access token found.</h2>
-                        <p>Please <a href="/enter-tokens">enter your tokens</a> first.</p>
-                    </body>
-                </html>
-                '''
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-        }
-        schedule_url = "https://connect.bracu.ac.bd/api/adv/v1/advising/sections/student/42749/schedules"
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(schedule_url, headers=headers)
-            if resp.status_code != 200:
-                return f"<pre>Failed: {resp.status_code}\n{resp.text}</pre>"
-            data = resp.json()
-            return f"<pre>{json.dumps(data, indent=2)}</pre>"
-    except Exception as e:
-        return f"<pre>Error: {str(e)}</pre>"
-
-@app.get("/mytokens", response_class=HTMLResponse)
-async def view_tokens(request: Request):
-    """View stored tokens (requires authentication)."""
-    tokens = await load_tokens()
-    if not tokens:
-        return "<h2>No tokens stored. Please login and save your tokens first.</h2>"
-    return f"<h2>Stored Tokens</h2><pre>{json.dumps(tokens, indent=2)}</pre>"
+    return HTMLResponse(html_content)
 
 @app.get("/enter-tokens", response_class=HTMLResponse)
 async def enter_tokens_form(request: Request):
-    """Serve the form to manually enter tokens."""
-    return """
-    <html>
-        <head>
-            <title>Enter Tokens</title>
-            <style>
-                body { font-family: Arial, sans-serif; background: #f5f5f5; }
-                .container { max-width: 600px; margin: 40px auto; background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-                input, textarea { width: 100%; padding: 10px; margin: 10px 0 20px 0; border-radius: 4px; border: 1px solid #ccc; }
-                button { padding: 10px 20px; background: #007bff; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
-                button:hover { background: #0056b3; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h2>Manually Enter Your Tokens</h2>
-                <form method="post">
-                    <label>Access Token:</label>
-                    <textarea name="access_token" rows="4" required></textarea>
-                    <label>Refresh Token:</label>
-                    <textarea name="refresh_token" rows="4" required></textarea>
-                    <button type="submit">Save Tokens</button>
-                </form>
-            </div>
-        </body>
-    </html>
+    html_content = """
+    <html><head><title>Enter Tokens</title>
+    <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
+    .container { max-width: 420px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; }
+    h2 { color: #2d3748; margin-bottom: 18px; }
+    form { display: flex; flex-direction: column; gap: 16px; }
+    input { padding: 10px; border-radius: 6px; border: 1px solid #cbd5e0; font-size: 1rem; }
+    button { background: #3182ce; color: #fff; border: none; border-radius: 6px; padding: 10px 0; font-size: 1rem; cursor: pointer; transition: background 0.2s; }
+    button:hover { background: #225ea8; }
+    .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }
+    .back:hover { text-decoration: underline; }
+    </style></head><body>
+    <div class='container'>
+        <h2>Enter Your Tokens</h2>
+        <form action='/enter-tokens' method='post'>
+            <input name='access_token' placeholder='Access Token' required autocomplete='off'>
+            <input name='refresh_token' placeholder='Refresh Token' required autocomplete='off'>
+            <button type='submit'>Save Tokens</button>
+        </form>
+        <a class='back' href='/'>Back to Home</a>
+    </div></body></html>
     """
+    return HTMLResponse(html_content)
 
 @app.post("/enter-tokens", response_class=HTMLResponse)
-async def save_tokens_form(access_token: str = Form(...), refresh_token: str = Form(...)):
-    """Handle saving tokens."""
+async def save_tokens_form(request: Request, access_token: str = Form(...), refresh_token: str = Form(...)):
+    session_id = request.session.get("id")
+    if not session_id:
+        session_id = secrets.token_urlsafe(16)
+        request.session["id"] = session_id
+    
+    # Get token expiration from JWT
+    now = int(time.time())
+    access_jwt_data = decode_jwt_token(access_token)
+    refresh_jwt_data = decode_jwt_token(refresh_token)
+    
     tokens = {
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "expires_at": 0 
+        "expires_at": access_jwt_data.get("exp", now + 300),  # 5 minutes default
+        "refresh_expires_at": refresh_jwt_data.get("exp", now + 1800)  # 30 minutes default
     }
-    await save_tokens(tokens)
-    return """
-    <html>
-        <body>
-            <h2>Tokens saved!</h2>
-            <a href='/mytokens'>View Tokens</a>
-        </body>
-    </html>
+    
+    await save_tokens_to_redis(session_id, tokens)
+    html_content = """
+    <html><head><title>Tokens Saved</title>
+    <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
+    .container { max-width: 420px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
+    .msg { color: #2d3748; font-size: 1.1em; margin-bottom: 18px; }
+    .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }
+    .back:hover { text-decoration: underline; }
+    </style></head><body>
+    <div class='container'>
+        <div class='msg'>Tokens saved successfully!</div>
+        <a class='back' href='/'>Back to Home</a>
+    </div></body></html>
     """
+    return HTMLResponse(html_content)
+
+@app.get("/mytokens", response_class=HTMLResponse)
+async def view_tokens(request: Request, session_id: str = None):
+    # Get current user's session
+    current_session = request.session.get("id")
+    if not current_session:
+        return HTMLResponse("""
+            <html><head><title>Error</title>
+            <style>
+            body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
+            .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
+            .error { color: #e53e3e; margin-bottom: 18px; }
+            .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }
+            .back:hover { text-decoration: underline; }
+            </style></head><body>
+            <div class='container'>
+                <div class='error'>No session found. Please visit the home page first.</div>
+                <a class='back' href='/'>Back to Home</a>
+            </div></body></html>
+        """)
+
+    # If a specific session_id is requested, verify it matches the current session
+    if session_id and session_id != current_session:
+        return HTMLResponse("""
+            <html><head><title>Error</title>
+            <style>
+            body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
+            .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
+            .error { color: #e53e3e; margin-bottom: 18px; }
+            .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }
+            .back:hover { text-decoration: underline; }
+            </style></head><body>
+            <div class='container'>
+                <div class='error'>You can only view tokens for your own session.</div>
+                <a class='back' href='/'>Back to Home</a>
+            </div></body></html>
+        """, status_code=403)
+
+    # Load tokens for the current session
+    tokens = await load_tokens_from_redis(current_session)
+    
+    # Calculate token expiration times if tokens exist
+    token_info = ""
+    if tokens:
+        now = int(time.time())
+        access_expires_in = tokens.get("expires_at", 0) - now
+        refresh_expires_in = tokens.get("refresh_expires_at", 0) - now
+        token_info = f"""
+        <div class='token-info'>
+            <div class='expiry'>Access token expires in: {access_expires_in} seconds</div>
+            <div class='expiry'>Refresh token expires in: {refresh_expires_in} seconds</div>
+        </div>
+        """
+
+    html_content = f"""
+    <html><head><title>My Tokens</title>
+    <style>
+    body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }}
+    .container {{ max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; }}
+    h2 {{ color: #2d3748; margin-bottom: 18px; }}
+    pre {{ background: #f7fafc; border-radius: 6px; padding: 18px; font-size: 1em; color: #2d3748; overflow-x: auto; }}
+    .msg {{ color: #e53e3e; margin-bottom: 18px; }}
+    .back {{ display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }}
+    .back:hover {{ text-decoration: underline; }}
+    .token-info {{ margin: 12px 0; padding: 12px; background: #ebf8ff; border-radius: 6px; }}
+    .expiry {{ color: #2b6cb0; margin: 4px 0; }}
+    .session {{ font-size: 0.9em; color: #718096; margin-top: 12px; }}
+    </style></head><body>
+    <div class='container'>
+        <h2>Your Tokens</h2>
+        {token_info if tokens else '<div class="msg">No tokens found for your session.</div>'}
+        {('<pre>' + json.dumps(tokens, indent=2) + '</pre>') if tokens else ''}
+        <div class='session'>Session ID: {current_session}</div>
+        <a class='back' href='/'>Back to Home</a>
+    </div></body></html>
+    """
+    return HTMLResponse(html_content)
+
+async def get_latest_valid_token():
+    """Get the most recent valid token from Redis, attempting to refresh if needed."""
+    try:
+        # Get all token keys
+        token_keys = await redis_client.keys("tokens:*")
+        if not token_keys:
+            logger.warning("No tokens found in Redis")
+            return None
+            
+        # First try to find a valid token
+        for key in token_keys:
+            tokens_str = await redis_client.get(key)
+            if tokens_str:
+                tokens = json.loads(tokens_str)
+                if not is_token_expired(tokens):
+                    logger.info("Found valid token")
+                    return tokens.get("access_token")
+        
+        # If no valid token found, try to refresh any available refresh token
+        logger.info("No valid token found, attempting refresh")
+        for key in token_keys:
+            tokens_str = await redis_client.get(key)
+            if tokens_str:
+                tokens = json.loads(tokens_str)
+                if "refresh_token" in tokens:
+                    # Extract session_id from the key (format: "tokens:session_id")
+                    session_id = key.split(":")[-1]
+                    new_tokens = await refresh_access_token(tokens["refresh_token"])
+                    if new_tokens:
+                        # Save the refreshed tokens
+                        await save_tokens_to_redis(session_id, new_tokens)
+                        logger.info("Successfully refreshed token")
+                        return new_tokens.get("access_token")
+        
+        logger.warning("No valid tokens found and refresh attempts failed")
+        return None
+    except Exception as e:
+        logger.error(f"Error getting/refreshing token: {str(e)}")
+        return None
+
+@app.get("/raw-schedule", response_class=JSONResponse)
+async def raw_schedule(request: Request):
+    """Get the raw schedule data. Public endpoint using most recent valid token."""
+    # Get the most recent valid token
+    token = await get_latest_valid_token()
+    if not token:
+        return JSONResponse({"error": "No valid token available"}, status_code=503)
+    
+    # Set up headers with the token
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Mozilla/5.0",
+        "Origin": "https://connect.bracu.ac.bd",
+        "Referer": "https://connect.bracu.ac.bd/"
+    }
+    
+    # First fetch student_id from portfolios endpoint
+    portfolios_url = "https://connect.bracu.ac.bd/api/mds/v1/portfolios"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(portfolios_url, headers=headers)
+            if resp.status_code != 200:
+                return JSONResponse({
+                    "error": "Failed to fetch student info", 
+                    "status_code": resp.status_code, 
+                    "details": resp.text
+                }, status_code=resp.status_code)
+            
+            data = resp.json()
+            if not isinstance(data, list) or not data or "id" not in data[0]:
+                return JSONResponse({"error": "Could not find student id in response."}, status_code=500)
+            
+            student_id = data[0]["id"]
+
+    except Exception as e:
+        logger.error(f"Error fetching student info: {str(e)}")
+        return JSONResponse({"error": f"Failed to fetch student info: {str(e)}"}, status_code=500)
+
+    # Try to fetch the schedule
+    schedule_url = f"https://connect.bracu.ac.bd/api/adv/v1/advising/sections/student/{student_id}/schedules"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(schedule_url, headers=headers)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                # Cache the successful response
+                await save_student_schedule(student_id, data)
+                return JSONResponse(data)
+            else:
+                # On any error, try to return cached schedule
+                cached_schedule = await load_student_schedule(student_id)
+                if cached_schedule:
+                    return JSONResponse({
+                        "cached": True,
+                        "data": cached_schedule,
+                        "message": f"Using cached schedule due to API error: {resp.status_code}"
+                    })
+                return JSONResponse({
+                    "error": f"Failed to fetch schedule: {resp.text}",
+                    "status_code": resp.status_code
+                }, status_code=resp.status_code)
+                
+    except Exception as e:
+        logger.error(f"Error fetching schedule: {str(e)}")
+        # Try to return cached schedule if available
+        cached_schedule = await load_student_schedule(student_id)
+        if cached_schedule:
+            return JSONResponse({
+                "cached": True,
+                "data": cached_schedule,
+                "message": "Using cached schedule due to error"
+            })
+        return JSONResponse({
+            "error": f"Failed to fetch schedule: {str(e)}"
+        }, status_code=503)
 
 # Add CORS middleware with development settings
 if DEV_MODE:
@@ -455,9 +558,6 @@ else:
         expose_headers=["*"],
         max_age=3600,
     )
-
-# Add Connect portal middleware
-app.add_middleware(ConnectPortalMiddleware)
 
 # Add global exception handler
 @app.exception_handler(Exception)
