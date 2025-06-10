@@ -358,21 +358,28 @@ async def root(request: Request):
     if not session_id:
         session_id = secrets.token_urlsafe(16)
         request.session["id"] = session_id
-    # Calculate uptime
-    uptime_seconds = int(time.time() - start_time)
-    days, remainder = divmod(uptime_seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    uptime_str = []
-    if days:
-        uptime_str.append(f"{days} day{'s' if days != 1 else ''}")
-    if hours:
-        uptime_str.append(f"{hours} hour{'s' if hours != 1 else ''}")
-    if minutes:
-        uptime_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-    if seconds or not uptime_str:
-        uptime_str.append(f"{seconds} second{'s' if seconds != 1 else ''}")
-    uptime_display = ', '.join(uptime_str)
+    # Calculate token uptime (remaining time)
+    token_uptime_display = "No active token."
+    try:
+        tokens = await load_tokens_from_redis(session_id)
+        if tokens and "expires_at" in tokens:
+            now = int(time.time())
+            remaining = max(0, tokens["expires_at"] - now)
+            days, remainder = divmod(remaining, 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            uptime_str = []
+            if days:
+                uptime_str.append(f"{days} day{'s' if days != 1 else ''}")
+            if hours:
+                uptime_str.append(f"{hours} hour{'s' if hours != 1 else ''}")
+            if minutes:
+                uptime_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+            if seconds or not uptime_str:
+                uptime_str.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+            token_uptime_display = 'Token active for: ' + ', '.join(uptime_str)
+    except Exception:
+        pass
     html_content = f"""
     <html><head><title>BRACU Schedule Viewer</title>
     <style>
@@ -385,6 +392,7 @@ async def root(request: Request):
     .button:hover {{ background: #225ea8; }}
     .session-id {{ font-size: 0.9em; color: #718096; margin-top: 18px; text-align: center; }}
     .uptime {{ font-size: 0.9em; color: #718096; margin-top: 8px; text-align: center; }}
+    .token-uptime {{ font-size: 0.9em; color: #718096; margin-top: 8px; text-align: center; }}
     </style></head><body>
     <div class='container'>
         <h1>BRACU Schedule Viewer</h1>
@@ -395,7 +403,7 @@ async def root(request: Request):
             <a class='button' href='/raw-schedule'>View Raw Schedule</a>
         </div>
         <div class='session-id'>Session: {session_id}</div>
-        <div class='uptime'>Up for {uptime_display}</div>
+        <div class='token-uptime'>{token_uptime_display}</div>
     </div></body></html>
     """
     return HTMLResponse(html_content)
