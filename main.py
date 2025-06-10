@@ -50,7 +50,17 @@ class ErrorResponse(BaseModel):
 
 # Create FastAPI app first
 app = FastAPI()
-app.add_middleware(SessionMiddleware, secret_key="super-secret-session-key")
+
+# Configure session middleware with proper settings
+session_secret = os.environ.get("SESSION_SECRET", "super-secret-session-key")
+app.add_middleware(
+    SessionMiddleware, 
+    secret_key=session_secret,
+    session_cookie="session_id",
+    max_age=7 * 24 * 60 * 60,  # 7 days
+    same_site="lax",
+    https_only=True
+)
 
 # Upstash Redis config
 REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:AajsAAIjcDExN2MxMjVlNmRhMTc0ODI1OTlhMzRkZjY1MGFjZGJiNXAxMA@willing-husky-43244.upstash.io:6379"
@@ -70,6 +80,7 @@ async def startup_event():
     """Initialize Redis connection on startup."""
     global redis_client
     redis_client = await get_redis()
+    logger.info("Redis connection initialized")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -77,6 +88,7 @@ async def shutdown_event():
     global redis_client
     if redis_client:
         await redis_client.close()
+        logger.info("Redis connection closed")
 
 def decode_jwt_token(token: str) -> dict:
     """Decode a JWT token without verification to get expiration time."""
@@ -110,7 +122,7 @@ async def save_tokens_to_redis(session_id, tokens):
             jwt_data = decode_jwt_token(tokens["access_token"])
             if "exp" in jwt_data:
                 tokens["expires_at"] = jwt_data["exp"]
-                tokens["expires_in"] = max(0, jwt_data["exp"] - now)  # Calculate expires_in from JWT exp
+                tokens["expires_in"] = max(0, jwt_data["exp"] - now)
                 logger.info(f"Got token expiration from JWT: {tokens['expires_in']} seconds remaining")
             else:
                 # Fallback to default 5 minutes if no exp in JWT
@@ -122,24 +134,48 @@ async def save_tokens_to_redis(session_id, tokens):
         if "refresh_token" in tokens:
             tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes
         
-        await redis_conn.set(f"tokens:{session_id}", json.dumps(tokens))
-        logger.info(f"Tokens saved in Redis. Access token expires in {tokens.get('expires_in', 0)}s, "
-                    f"refresh token expires in {tokens.get('refresh_expires_at', 0) - now}s")
+        # Save tokens with expiration
+        key = f"tokens:{session_id}"
+        await redis_conn.set(key, json.dumps(tokens))
+        
+        # Set key expiration to match the refresh token expiration
+        await redis_conn.expire(key, 30 * 60)  # 30 minutes
+        
+        logger.info(f"Tokens saved in Redis for session {session_id}. Access token expires in {tokens.get('expires_in', 0)}s")
         return True
     except Exception as e:
         logger.error(f"Error saving tokens to Redis: {str(e)}")
         raise
 
 async def load_tokens_from_redis(session_id):
+    """Load tokens from Redis with validation."""
     try:
         redis_conn = await get_redis()
-        data = await redis_conn.get(f"tokens:{session_id}")
+        key = f"tokens:{session_id}"
+        data = await redis_conn.get(key)
+        
         if data:
             tokens = json.loads(data)
-            logger.info(f"Tokens loaded from Redis for session {session_id}.")
-            return tokens
+            # Validate token expiration
+            if not is_token_expired(tokens):
+                logger.info(f"Valid tokens loaded from Redis for session {session_id}")
+                return tokens
+            else:
+                logger.info(f"Expired tokens found for session {session_id}, attempting refresh")
+                if "refresh_token" in tokens:
+                    try:
+                        new_tokens = await refresh_access_token(tokens["refresh_token"])
+                        if new_tokens:
+                            await save_tokens_to_redis(session_id, new_tokens)
+                            return new_tokens
+                    except Exception as e:
+                        logger.error(f"Token refresh failed: {str(e)}")
+                
+                # If we get here, tokens are expired and refresh failed
+                await redis_conn.delete(key)
+                return None
         else:
-            logger.info(f"No tokens found in Redis for session {session_id}.")
+            logger.info(f"No tokens found in Redis for session {session_id}")
             return None
     except Exception as e:
         logger.error(f"Error loading tokens from Redis: {str(e)}")
@@ -293,6 +329,7 @@ async def get_latest_valid_token():
         latest_token = None
         latest_expiry = 0
         needs_refresh = True
+        session_id = None
         
         # First try to find the most recent valid token
         for key in token_keys:
@@ -305,6 +342,7 @@ async def get_latest_valid_token():
                         latest_token = tokens
                         latest_expiry = tokens["expires_at"]
                         needs_refresh = is_token_expired(tokens)
+                        session_id = key.split(":")[-1]
         
         # If we found a valid token that doesn't need refresh, use it
         if latest_token and not needs_refresh:
@@ -312,18 +350,19 @@ async def get_latest_valid_token():
             return latest_token.get("access_token")
         
         # If we have a token but it needs refresh, try to refresh it
-        if latest_token and "refresh_token" in latest_token:
+        if latest_token and "refresh_token" in latest_token and session_id:
             logger.info("Attempting to refresh token")
             try:
                 new_tokens = await refresh_access_token(latest_token["refresh_token"])
                 if new_tokens and "access_token" in new_tokens:
-                    # Save the refreshed tokens with the same session ID
-                    session_id = [k for k in token_keys if await redis_conn.get(k) == tokens_str][0].split(":")[-1]
+                    # Save the refreshed tokens
                     await save_tokens_to_redis(session_id, new_tokens)
                     logger.info("Successfully refreshed token")
                     return new_tokens.get("access_token")
             except Exception as e:
                 logger.error(f"Error refreshing token: {str(e)}")
+                # Delete the expired/invalid tokens
+                await redis_conn.delete(f"tokens:{session_id}")
         
         logger.warning("No valid tokens found and refresh attempts failed")
         return None
@@ -506,8 +545,21 @@ async def view_tokens(request: Request, session_id: str = None):
 async def raw_schedule(request: Request):
     """Get the raw schedule data. Public endpoint using most recent valid token."""
     try:
-        # Get the most recent valid token
-        token = await get_latest_valid_token()
+        # Get current session
+        session_id = request.session.get("id")
+        
+        # First try to get token from current session
+        if session_id:
+            tokens = await load_tokens_from_redis(session_id)
+            if tokens and "access_token" in tokens and not is_token_expired(tokens):
+                token = tokens["access_token"]
+            else:
+                # If session tokens are invalid/expired, try to get latest valid token
+                token = await get_latest_valid_token()
+        else:
+            # No session, try to get latest valid token
+            token = await get_latest_valid_token()
+        
         if not token:
             return JSONResponse({"error": "No valid token available"}, status_code=503)
         
@@ -525,8 +577,11 @@ async def raw_schedule(request: Request):
         async with httpx.AsyncClient() as client:
             resp = await client.get(portfolios_url, headers=headers)
             if resp.status_code == 401:  # Unauthorized - token might be invalid
-                logger.warning("Token unauthorized, clearing and retrying")
-                return JSONResponse({"error": "Token expired, please refresh"}, status_code=401)
+                logger.warning("Token unauthorized, attempting refresh")
+                # Clear the invalid token and try again with a fresh token
+                if session_id:
+                    await redis_conn.delete(f"tokens:{session_id}")
+                return JSONResponse({"error": "Token expired, please refresh page"}, status_code=401)
             
             if resp.status_code != 200:
                 return JSONResponse({
@@ -551,8 +606,11 @@ async def raw_schedule(request: Request):
                 await save_student_schedule(student_id, data)
                 return JSONResponse(data)
             elif resp.status_code == 401:  # Unauthorized - token might be invalid
-                logger.warning("Token unauthorized, clearing and retrying")
-                return JSONResponse({"error": "Token expired, please refresh"}, status_code=401)
+                logger.warning("Token unauthorized, attempting refresh")
+                # Clear the invalid token
+                if session_id:
+                    await redis_conn.delete(f"tokens:{session_id}")
+                return JSONResponse({"error": "Token expired, please refresh page"}, status_code=401)
             else:
                 # On any error, try to return cached schedule
                 cached_schedule = await load_student_schedule(student_id)
