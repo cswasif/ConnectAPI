@@ -88,6 +88,18 @@ View the tokens associated with the current session.
 - **Requires a valid session**
 - Not accessible to the public without a session
 
+## Live API URLs & Usage
+
+- **Base URL:** https://connapi.vercel.app
+- **Raw Schedule Endpoint:** https://connapi.vercel.app/raw-schedule
+
+### How to Use
+
+- Visit [https://connapi.vercel.app/raw-schedule](https://connapi.vercel.app/raw-schedule) in your browser or use it in your application to fetch the latest available schedule data.
+- If a valid token has been submitted (via the web UI at `/enter-tokens`), the endpoint will show the latest real schedule from the BRACU Connect API.
+- If no valid token is available, it will show the most recently cached schedule (if any exists).
+- The endpoint returns data in JSON format and is public—no authentication is required.
+
 ## Dependencies
 
 - Python 3.7+
