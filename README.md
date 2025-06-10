@@ -42,10 +42,6 @@ pip install -r requirements.txt
 ```env
 # Upstash Redis Configuration
 REDIS_URL=rediss://default:your-password@willing-husky-43244.upstash.io:6379
-
-# OAuth Configuration
-OAUTH_CLIENT_ID=your_client_id
-OAUTH_CLIENT_SECRET=your_client_secret
 ```
 
 5. Run the server locally:
@@ -61,8 +57,6 @@ This project is configured for deployment on Vercel:
 2. Connect your fork to Vercel
 3. Add your environment variables in Vercel:
    - `REDIS_URL` (from Upstash)
-   - `OAUTH_CLIENT_ID`
-   - `OAUTH_CLIENT_SECRET`
 4. Deploy!
 
 ## API Endpoints
