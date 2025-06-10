@@ -10,6 +10,7 @@ A FastAPI-based API service for accessing BRACU (BRAC University) student schedu
 - Error handling and fallback mechanisms
 - Deployed on Vercel
 - **Session-based security for sensitive endpoints**: Only users with a valid session can access `/enter-tokens` and `/mytokens`. The `/raw-schedule` endpoint remains public.
+- **Token uptime display**: The home page shows how long your current token will remain active (if any).
 
 ## Tech Stack
 
@@ -99,6 +100,7 @@ View the tokens associated with the current session.
 - If a valid token has been submitted (via the web UI at `/enter-tokens`), the endpoint will show the latest real schedule from the BRACU Connect API.
 - If no valid token is available, it will show the most recently cached schedule (if any exists).
 - The endpoint returns data in JSON format and is public—no authentication is required.
+- **The home page also displays the remaining active time (uptime) of your current token, if available.**
 
 ## Dependencies
 
