@@ -62,7 +62,7 @@ This project is configured for deployment on Vercel:
 ## API Endpoints
 
 ### GET /raw-schedule
-Fetches the current schedule using the most recent valid token.
+Fetches the current schedule using the most recent valid token, or falls back to the latest cached schedule if no valid token is available.
 
 - No authentication required
 - Returns schedule data in JSON format
@@ -71,7 +71,8 @@ Fetches the current schedule using the most recent valid token.
   - The endpoint always tries to fetch the latest real schedule from the Connect API using the most recent valid token.
   - If the live API call is successful, it updates the cache and returns the fresh data.
   - If the live API call fails (e.g., network error, token expired), it falls back to the most recently cached schedule (if available).
-  - If no valid token or cached schedule exists, an error is returned.
+  - **If no valid token is available at all, it will show the most recently cached schedule (from any student) if present.**
+  - If neither a valid token nor any cached schedule exists, an error is returned.
 - **Everyone sees the same schedule**—it is not user-specific.
 
 ### GET/POST /enter-tokens
