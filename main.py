@@ -69,30 +69,8 @@ async def session_error_handler(request: Request, call_next):
 # Upstash Redis config
 REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:AajsAAIjcDExN2MxMjVlNmRhMTc0ODI1OTlhMzRkZjY1MGFjZGJiNXAxMA@willing-husky-43244.upstash.io:6379"
 
-# Initialize Redis client as None, will be created per request
-redis_client = None
-
 async def get_redis():
-    """Get or create Redis client."""
-    global redis_client
-    if redis_client is None:
-        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    return redis_client
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize Redis connection on startup."""
-    global redis_client
-    redis_client = await get_redis()
-    logger.info("Redis connection initialized")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Close Redis connection on shutdown."""
-    global redis_client
-    if redis_client:
-        await redis_client.close()
-        logger.info("Redis connection closed")
+    return redis.from_url(REDIS_URL, decode_responses=True)
 
 def decode_jwt_token(token: str) -> dict:
     """Decode a JWT token without verification to get expiration time."""
