@@ -482,6 +482,12 @@ async def save_tokens_form(request: Request, access_token: str = Form(...), refr
         "expires_at": access_jwt_data.get("exp", now + 300),  # 5 minutes default
         "refresh_expires_at": refresh_jwt_data.get("exp", now + 1800)  # 30 minutes default
     }
+    # Set activated_at if not already present in Redis
+    existing = await load_tokens_from_redis(session_id)
+    if existing and "activated_at" in existing:
+        tokens["activated_at"] = existing["activated_at"]
+    else:
+        tokens["activated_at"] = now
     
     await save_tokens_to_redis(session_id, tokens)
     html_content = """
