@@ -51,16 +51,20 @@ class ErrorResponse(BaseModel):
 # Create FastAPI app first
 app = FastAPI()
 
-# Configure session middleware with proper settings
-session_secret = os.environ.get("SESSION_SECRET", "super-secret-session-key")
+# Add middleware in correct order
+app.add_middleware(SessionMiddleware, secret_key="super-secret-session-key")
 app.add_middleware(
-    SessionMiddleware, 
-    secret_key=session_secret,
-    session_cookie="session_id",
-    max_age=7 * 24 * 60 * 60,  # 7 days
-    same_site="lax",
-    https_only=True
+    CORSMiddleware,
+    allow_origins=[settings.FRONTEND_URL] if not DEV_MODE else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def session_error_handler(request: Request, call_next):
+    response = await call_next(request)
+    return response
 
 # Upstash Redis config
 REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:AajsAAIjcDExN2MxMjVlNmRhMTc0ODI1OTlhMzRkZjY1MGFjZGJiNXAxMA@willing-husky-43244.upstash.io:6379"
@@ -370,15 +374,6 @@ async def get_latest_valid_token():
         logger.error(f"Error in get_latest_valid_token: {str(e)}")
         return None
 
-@app.middleware("http")
-async def session_middleware(request: Request, call_next):
-    """Ensure session is properly initialized for all requests."""
-    if not request.session.get("id"):
-        request.session["id"] = secrets.token_urlsafe(16)
-        logger.info(f"New session created: {request.session['id']}")
-    response = await call_next(request)
-    return response
-
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     session_id = request.session.get("id")
@@ -676,28 +671,6 @@ async def raw_schedule(request: Request):
         return JSONResponse({
             "error": f"Internal server error: {str(e)}"
         }, status_code=500)
-
-# Add CORS middleware with development settings
-if DEV_MODE:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["http://localhost:5175", "http://localhost:5176", "http://localhost:8000", "https://connect.bracu.ac.bd"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-        max_age=3600,
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[settings.FRONTEND_URL, "https://connect.bracu.ac.bd"],
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-        max_age=3600,
-    )
 
 # Add global exception handler
 @app.exception_handler(Exception)
