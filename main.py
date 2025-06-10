@@ -564,26 +564,35 @@ async def view_tokens(request: Request, session_id: str = None):
 
 @app.get("/raw-schedule", response_class=JSONResponse)
 async def raw_schedule(request: Request):
-    """Get the raw schedule data. Public endpoint using most recent valid token."""
+    """Get the raw schedule data. Public endpoint using most recent valid token or latest cached schedule."""
     try:
-        # Get current session
         session_id = request.session.get("id")
-        
-        # First try to get token from current session
+        # Try to get a valid token
         if session_id:
             tokens = await load_tokens_from_redis(session_id)
             if tokens and "access_token" in tokens and not is_token_expired(tokens):
                 token = tokens["access_token"]
             else:
-                # If session tokens are invalid/expired, try to get latest valid token
                 token = await get_latest_valid_token()
         else:
-            # No session, try to get latest valid token
             token = await get_latest_valid_token()
-        
+
         if not token:
-            return JSONResponse({"error": "No valid token available"}, status_code=503)
-        
+            # No valid token, try to return the most recently cached schedule
+            redis_conn = await get_redis()
+            keys = await redis_conn.keys("student_schedule:*")
+            if keys:
+                # Get the latest schedule by key (lexicographically last, or you can sort by last modified if needed)
+                latest_key = sorted(keys)[-1]
+                cached_schedule = await redis_conn.get(latest_key)
+                if cached_schedule:
+                    return JSONResponse({
+                        "cached": True,
+                        "data": json.loads(cached_schedule),
+                        "message": "Showing latest cached schedule (no valid token available)"
+                    })
+            return JSONResponse({"error": "No valid token or cached schedule available"}, status_code=503)
+
         # Set up headers with the token
         headers = {
             "Accept": "application/json",
