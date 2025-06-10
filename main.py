@@ -270,36 +270,66 @@ async def refresh_access_token(refresh_token: str) -> dict:
         return None
 
 def is_token_expired(tokens, buffer=60):
-    """Check if the token is expired or will expire soon."""
-    # buffer: seconds before expiry to refresh
-    if not tokens or "expires_at" not in tokens:
-        return True
-    return int(time.time()) > int(tokens["expires_at"]) - buffer
-
-async def ensure_valid_token(session_id: str, tokens: dict) -> tuple[str, dict]:
-    """Ensure we have a valid access token, refreshing if necessary."""
+    """Check if tokens are expired with a buffer time."""
     if not tokens:
-        logger.error("No tokens provided")
-        return None, tokens
-        
-    # Check if token is expired or will expire soon
-    if is_token_expired(tokens):
-        if "refresh_token" in tokens:
-            logger.info("Access token expired or expiring soon, attempting refresh")
-            new_tokens = await refresh_access_token(tokens["refresh_token"])
-            if new_tokens:
-                # Save the new tokens immediately
-                await save_tokens_to_redis(session_id, new_tokens)
-                logger.info("Successfully refreshed and saved new tokens")
-                return new_tokens.get("access_token"), new_tokens
-            else:
-                logger.error("Token refresh failed")
-                return None, tokens
-        else:
-            logger.error("No refresh token available")
-            return None, tokens
+        return True
+    now = int(time.time())
+    # Check access token expiration
+    if "expires_at" in tokens:
+        if now + buffer >= tokens["expires_at"]:
+            return True
+    return False
+
+async def get_latest_valid_token():
+    """Get the most recent valid token from Redis, attempting to refresh if needed."""
+    try:
+        # Get all token keys
+        redis_conn = await get_redis()
+        token_keys = await redis_conn.keys("tokens:*")
+        if not token_keys:
+            logger.warning("No tokens found in Redis")
+            return None
             
-    return tokens.get("access_token"), tokens
+        latest_token = None
+        latest_expiry = 0
+        needs_refresh = True
+        
+        # First try to find the most recent valid token
+        for key in token_keys:
+            tokens_str = await redis_conn.get(key)
+            if tokens_str:
+                tokens = json.loads(tokens_str)
+                if "expires_at" in tokens:
+                    # If this token expires later than our current latest, update it
+                    if tokens["expires_at"] > latest_expiry:
+                        latest_token = tokens
+                        latest_expiry = tokens["expires_at"]
+                        needs_refresh = is_token_expired(tokens)
+        
+        # If we found a valid token that doesn't need refresh, use it
+        if latest_token and not needs_refresh:
+            logger.info("Using existing valid token")
+            return latest_token.get("access_token")
+        
+        # If we have a token but it needs refresh, try to refresh it
+        if latest_token and "refresh_token" in latest_token:
+            logger.info("Attempting to refresh token")
+            try:
+                new_tokens = await refresh_access_token(latest_token["refresh_token"])
+                if new_tokens and "access_token" in new_tokens:
+                    # Save the refreshed tokens with the same session ID
+                    session_id = [k for k in token_keys if await redis_conn.get(k) == tokens_str][0].split(":")[-1]
+                    await save_tokens_to_redis(session_id, new_tokens)
+                    logger.info("Successfully refreshed token")
+                    return new_tokens.get("access_token")
+            except Exception as e:
+                logger.error(f"Error refreshing token: {str(e)}")
+        
+        logger.warning("No valid tokens found and refresh attempts failed")
+        return None
+    except Exception as e:
+        logger.error(f"Error in get_latest_valid_token: {str(e)}")
+        return None
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
@@ -472,68 +502,32 @@ async def view_tokens(request: Request, session_id: str = None):
     """
     return HTMLResponse(html_content)
 
-async def get_latest_valid_token():
-    """Get the most recent valid token from Redis, attempting to refresh if needed."""
-    try:
-        # Get all token keys
-        token_keys = await redis_client.keys("tokens:*")
-        if not token_keys:
-            logger.warning("No tokens found in Redis")
-            return None
-            
-        # First try to find a valid token
-        for key in token_keys:
-            tokens_str = await redis_client.get(key)
-            if tokens_str:
-                tokens = json.loads(tokens_str)
-                if not is_token_expired(tokens):
-                    logger.info("Found valid token")
-                    return tokens.get("access_token")
-        
-        # If no valid token found, try to refresh any available refresh token
-        logger.info("No valid token found, attempting refresh")
-        for key in token_keys:
-            tokens_str = await redis_client.get(key)
-            if tokens_str:
-                tokens = json.loads(tokens_str)
-                if "refresh_token" in tokens:
-                    # Extract session_id from the key (format: "tokens:session_id")
-                    session_id = key.split(":")[-1]
-                    new_tokens = await refresh_access_token(tokens["refresh_token"])
-                    if new_tokens:
-                        # Save the refreshed tokens
-                        await save_tokens_to_redis(session_id, new_tokens)
-                        logger.info("Successfully refreshed token")
-                        return new_tokens.get("access_token")
-        
-        logger.warning("No valid tokens found and refresh attempts failed")
-        return None
-    except Exception as e:
-        logger.error(f"Error getting/refreshing token: {str(e)}")
-        return None
-
 @app.get("/raw-schedule", response_class=JSONResponse)
 async def raw_schedule(request: Request):
     """Get the raw schedule data. Public endpoint using most recent valid token."""
-    # Get the most recent valid token
-    token = await get_latest_valid_token()
-    if not token:
-        return JSONResponse({"error": "No valid token available"}, status_code=503)
-    
-    # Set up headers with the token
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "Mozilla/5.0",
-        "Origin": "https://connect.bracu.ac.bd",
-        "Referer": "https://connect.bracu.ac.bd/"
-    }
-    
-    # First fetch student_id from portfolios endpoint
-    portfolios_url = "https://connect.bracu.ac.bd/api/mds/v1/portfolios"
     try:
+        # Get the most recent valid token
+        token = await get_latest_valid_token()
+        if not token:
+            return JSONResponse({"error": "No valid token available"}, status_code=503)
+        
+        # Set up headers with the token
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Mozilla/5.0",
+            "Origin": "https://connect.bracu.ac.bd",
+            "Referer": "https://connect.bracu.ac.bd/"
+        }
+        
+        # First fetch student_id from portfolios endpoint
+        portfolios_url = "https://connect.bracu.ac.bd/api/mds/v1/portfolios"
         async with httpx.AsyncClient() as client:
             resp = await client.get(portfolios_url, headers=headers)
+            if resp.status_code == 401:  # Unauthorized - token might be invalid
+                logger.warning("Token unauthorized, clearing and retrying")
+                return JSONResponse({"error": "Token expired, please refresh"}, status_code=401)
+            
             if resp.status_code != 200:
                 return JSONResponse({
                     "error": "Failed to fetch student info", 
@@ -547,14 +541,8 @@ async def raw_schedule(request: Request):
             
             student_id = data[0]["id"]
 
-    except Exception as e:
-        logger.error(f"Error fetching student info: {str(e)}")
-        return JSONResponse({"error": f"Failed to fetch student info: {str(e)}"}, status_code=500)
-
-    # Try to fetch the schedule
-    schedule_url = f"https://connect.bracu.ac.bd/api/adv/v1/advising/sections/student/{student_id}/schedules"
-    try:
-        async with httpx.AsyncClient() as client:
+            # Try to fetch the schedule
+            schedule_url = f"https://connect.bracu.ac.bd/api/adv/v1/advising/sections/student/{student_id}/schedules"
             resp = await client.get(schedule_url, headers=headers)
             
             if resp.status_code == 200:
@@ -562,6 +550,9 @@ async def raw_schedule(request: Request):
                 # Cache the successful response
                 await save_student_schedule(student_id, data)
                 return JSONResponse(data)
+            elif resp.status_code == 401:  # Unauthorized - token might be invalid
+                logger.warning("Token unauthorized, clearing and retrying")
+                return JSONResponse({"error": "Token expired, please refresh"}, status_code=401)
             else:
                 # On any error, try to return cached schedule
                 cached_schedule = await load_student_schedule(student_id)
@@ -577,18 +568,10 @@ async def raw_schedule(request: Request):
                 }, status_code=resp.status_code)
                 
     except Exception as e:
-        logger.error(f"Error fetching schedule: {str(e)}")
-        # Try to return cached schedule if available
-        cached_schedule = await load_student_schedule(student_id)
-        if cached_schedule:
-            return JSONResponse({
-                "cached": True,
-                "data": cached_schedule,
-                "message": "Using cached schedule due to error"
-            })
+        logger.error(f"Error in raw_schedule: {str(e)}")
         return JSONResponse({
-            "error": f"Failed to fetch schedule: {str(e)}"
-        }, status_code=503)
+            "error": f"Internal server error: {str(e)}"
+        }, status_code=500)
 
 # Add CORS middleware with development settings
 if DEV_MODE:
