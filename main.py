@@ -370,6 +370,15 @@ async def get_latest_valid_token():
         logger.error(f"Error in get_latest_valid_token: {str(e)}")
         return None
 
+@app.middleware("http")
+async def session_middleware(request: Request, call_next):
+    """Ensure session is properly initialized for all requests."""
+    if not request.session.get("id"):
+        request.session["id"] = secrets.token_urlsafe(16)
+        logger.info(f"New session created: {request.session['id']}")
+    response = await call_next(request)
+    return response
+
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     session_id = request.session.get("id")
@@ -466,80 +475,117 @@ async def save_tokens_form(request: Request, access_token: str = Form(...), refr
 
 @app.get("/mytokens", response_class=HTMLResponse)
 async def view_tokens(request: Request, session_id: str = None):
-    # Get current user's session
-    current_session = request.session.get("id")
-    if not current_session:
-        return HTMLResponse("""
-            <html><head><title>Error</title>
-            <style>
-            body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
-            .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
-            .error { color: #e53e3e; margin-bottom: 18px; }
-            .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }
-            .back:hover { text-decoration: underline; }
-            </style></head><body>
-            <div class='container'>
-                <div class='error'>No session found. Please visit the home page first.</div>
-                <a class='back' href='/'>Back to Home</a>
-            </div></body></html>
-        """)
+    """View tokens for the current session."""
+    try:
+        # Get current user's session
+        current_session = request.session.get("id")
+        if not current_session:
+            current_session = secrets.token_urlsafe(16)
+            request.session["id"] = current_session
+            logger.info(f"Created new session: {current_session}")
+        
+        # If a specific session_id is requested, verify it matches the current session
+        if session_id and session_id != current_session:
+            return HTMLResponse("""
+                <html><head><title>Error</title>
+                <style>
+                body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
+                .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
+                .error { color: #e53e3e; margin-bottom: 18px; }
+                .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }
+                .back:hover { text-decoration: underline; }
+                </style></head><body>
+                <div class='container'>
+                    <div class='error'>You can only view tokens for your own session.</div>
+                    <a class='back' href='/'>Back to Home</a>
+                </div></body></html>
+            """, status_code=403)
 
-    # If a specific session_id is requested, verify it matches the current session
-    if session_id and session_id != current_session:
-        return HTMLResponse("""
-            <html><head><title>Error</title>
-            <style>
-            body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
-            .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
-            .error { color: #e53e3e; margin-bottom: 18px; }
-            .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }
-            .back:hover { text-decoration: underline; }
-            </style></head><body>
-            <div class='container'>
-                <div class='error'>You can only view tokens for your own session.</div>
-                <a class='back' href='/'>Back to Home</a>
-            </div></body></html>
-        """, status_code=403)
+        # Load tokens for the current session
+        redis_conn = await get_redis()
+        tokens = await load_tokens_from_redis(current_session)
+        
+        # If no tokens found in current session, try to get the latest valid token
+        if not tokens:
+            latest_token = await get_latest_valid_token()
+            if latest_token:
+                # Create new tokens object with the latest token
+                tokens = {
+                    "access_token": latest_token,
+                    "expires_at": int(time.time()) + 300,  # 5 minutes default
+                    "refresh_expires_at": int(time.time()) + 1800  # 30 minutes default
+                }
+                # Save these tokens to the current session
+                await save_tokens_to_redis(current_session, tokens)
+                logger.info(f"Saved latest valid token to session {current_session}")
+        
+        # Calculate token expiration times if tokens exist
+        token_info = ""
+        if tokens:
+            now = int(time.time())
+            access_expires_in = max(0, tokens.get("expires_at", 0) - now)
+            refresh_expires_in = max(0, tokens.get("refresh_expires_at", 0) - now)
+            
+            # If tokens are expired, try to refresh them
+            if access_expires_in <= 0 and "refresh_token" in tokens:
+                try:
+                    new_tokens = await refresh_access_token(tokens["refresh_token"])
+                    if new_tokens:
+                        await save_tokens_to_redis(current_session, new_tokens)
+                        tokens = new_tokens
+                        access_expires_in = max(0, tokens.get("expires_at", 0) - now)
+                        refresh_expires_in = max(0, tokens.get("refresh_expires_at", 0) - now)
+                        logger.info(f"Refreshed tokens for session {current_session}")
+                except Exception as e:
+                    logger.error(f"Token refresh failed: {str(e)}")
+            
+            token_info = f"""
+            <div class='token-info'>
+                <div class='expiry'>Access token expires in: {access_expires_in} seconds</div>
+                <div class='expiry'>Refresh token expires in: {refresh_expires_in} seconds</div>
+            </div>
+            """
 
-    # Load tokens for the current session
-    tokens = await load_tokens_from_redis(current_session)
-    
-    # Calculate token expiration times if tokens exist
-    token_info = ""
-    if tokens:
-        now = int(time.time())
-        access_expires_in = tokens.get("expires_at", 0) - now
-        refresh_expires_in = tokens.get("refresh_expires_at", 0) - now
-        token_info = f"""
-        <div class='token-info'>
-            <div class='expiry'>Access token expires in: {access_expires_in} seconds</div>
-            <div class='expiry'>Refresh token expires in: {refresh_expires_in} seconds</div>
-        </div>
+        html_content = f"""
+        <html><head><title>My Tokens</title>
+        <style>
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }}
+        .container {{ max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; }}
+        h2 {{ color: #2d3748; margin-bottom: 18px; }}
+        pre {{ background: #f7fafc; border-radius: 6px; padding: 18px; font-size: 1em; color: #2d3748; overflow-x: auto; }}
+        .msg {{ color: #e53e3e; margin-bottom: 18px; }}
+        .back {{ display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }}
+        .back:hover {{ text-decoration: underline; }}
+        .token-info {{ margin: 12px 0; padding: 12px; background: #ebf8ff; border-radius: 6px; }}
+        .expiry {{ color: #2b6cb0; margin: 4px 0; }}
+        .session {{ font-size: 0.9em; color: #718096; margin-top: 12px; }}
+        </style></head><body>
+        <div class='container'>
+            <h2>Your Tokens</h2>
+            {token_info if tokens else '<div class="msg">No tokens found for your session.</div>'}
+            {('<pre>' + json.dumps(tokens, indent=2) + '</pre>') if tokens else ''}
+            <div class='session'>Session ID: {current_session}</div>
+            <a class='back' href='/'>Back to Home</a>
+        </div></body></html>
         """
-
-    html_content = f"""
-    <html><head><title>My Tokens</title>
-    <style>
-    body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }}
-    .container {{ max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; }}
-    h2 {{ color: #2d3748; margin-bottom: 18px; }}
-    pre {{ background: #f7fafc; border-radius: 6px; padding: 18px; font-size: 1em; color: #2d3748; overflow-x: auto; }}
-    .msg {{ color: #e53e3e; margin-bottom: 18px; }}
-    .back {{ display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }}
-    .back:hover {{ text-decoration: underline; }}
-    .token-info {{ margin: 12px 0; padding: 12px; background: #ebf8ff; border-radius: 6px; }}
-    .expiry {{ color: #2b6cb0; margin: 4px 0; }}
-    .session {{ font-size: 0.9em; color: #718096; margin-top: 12px; }}
-    </style></head><body>
-    <div class='container'>
-        <h2>Your Tokens</h2>
-        {token_info if tokens else '<div class="msg">No tokens found for your session.</div>'}
-        {('<pre>' + json.dumps(tokens, indent=2) + '</pre>') if tokens else ''}
-        <div class='session'>Session ID: {current_session}</div>
-        <a class='back' href='/'>Back to Home</a>
-    </div></body></html>
-    """
-    return HTMLResponse(html_content)
+        return HTMLResponse(html_content)
+    except Exception as e:
+        logger.error(f"Error in view_tokens: {str(e)}")
+        return HTMLResponse(f"""
+            <html><head><title>Error</title>
+            <style>
+            body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }}
+            .container {{ max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }}
+            .error {{ color: #e53e3e; margin-bottom: 18px; }}
+            .back {{ display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }}
+            .back:hover {{ text-decoration: underline; }}
+            </style></head><body>
+            <div class='container'>
+                <div class='error'>An error occurred while loading tokens.</div>
+                <div class='error'>{str(e)}</div>
+                <a class='back' href='/'>Back to Home</a>
+            </div></body></html>
+        """, status_code=500)
 
 @app.get("/raw-schedule", response_class=JSONResponse)
 async def raw_schedule(request: Request):
