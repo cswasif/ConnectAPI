@@ -407,6 +407,10 @@ async def root(request: Request):
 
 @app.get("/enter-tokens", response_class=HTMLResponse)
 async def enter_tokens_form(request: Request):
+    session_id = request.session.get("id")
+    if not session_id:
+        # No session, redirect to home
+        return RedirectResponse("/", status_code=302)
     html_content = """
     <html><head><title>Enter Tokens</title>
     <style>
@@ -436,8 +440,8 @@ async def enter_tokens_form(request: Request):
 async def save_tokens_form(request: Request, access_token: str = Form(...), refresh_token: str = Form(...)):
     session_id = request.session.get("id")
     if not session_id:
-        session_id = secrets.token_urlsafe(16)
-        request.session["id"] = session_id
+        # No session, redirect to home
+        return RedirectResponse("/", status_code=302)
     
     # Get token expiration from JWT
     now = int(time.time())
@@ -472,12 +476,10 @@ async def save_tokens_form(request: Request, access_token: str = Form(...), refr
 async def view_tokens(request: Request, session_id: str = None):
     """View tokens for the current session."""
     try:
-        # Get current user's session
         current_session = request.session.get("id")
         if not current_session:
-            current_session = secrets.token_urlsafe(16)
-            request.session["id"] = current_session
-            logger.info(f"Created new session: {current_session}")
+            # No session, redirect to home
+            return RedirectResponse("/", status_code=302)
         
         # If a specific session_id is requested, verify it matches the current session
         if session_id and session_id != current_session:
