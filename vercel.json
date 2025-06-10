@@ -15,6 +15,6 @@
     ],
     "env": {
         "PYTHONPATH": ".",
-        "REDIS_URL": "@redis_url"
+        "REDIS_URL": "rediss://default:AajsAAIjcDExN2MxMjVlNmRhMTc0ODI1OTlhMzRkZjY1MGFjZGJiNXAxMA@willing-husky-43244.upstash.io:6379"
     }
 } 
