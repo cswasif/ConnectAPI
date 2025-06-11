@@ -633,23 +633,37 @@ async def raw_schedule(request: Request):
         else:
             token = await get_latest_valid_token()
 
+        redis_conn = await get_redis()
+
+        def ensure_old_format(sections):
+            old_fields = [
+                "labSchedules", "labSectionId", "labCourseCode", "labFaculties",
+                "labName", "labRoomName", "prerequisiteCourses", "preRegLabSchedule", "preRegSchedule"
+            ]
+            for section in sections:
+                if isinstance(section.get("sectionSchedule"), str):
+                    try:
+                        section["sectionSchedule"] = json.loads(section["sectionSchedule"])
+                    except Exception:
+                        section["sectionSchedule"] = None
+                for key in old_fields:
+                    if key not in section:
+                        section[key] = None
+            return sections
+
         if not token:
-            # No valid token, try to return the most recently cached schedule
-            redis_conn = await get_redis()
             keys = await redis_conn.keys("student_schedule:*")
             if keys:
-                # Get the latest schedule by key (lexicographically last, or you can sort by last modified if needed)
                 latest_key = sorted(keys)[-1]
                 cached_schedule = await redis_conn.get(latest_key)
                 if cached_schedule:
+                    schedule_data = json.loads(cached_schedule)
                     return JSONResponse({
                         "cached": True,
-                        "data": json.loads(cached_schedule),
-                        "message": "Showing latest cached schedule (no valid token available)"
+                        "data": ensure_old_format(schedule_data)
                     })
             return JSONResponse({"error": "No valid token or cached schedule available"}, status_code=503)
 
-        # Set up headers with the token
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
@@ -658,13 +672,11 @@ async def raw_schedule(request: Request):
             "Referer": "https://connect.bracu.ac.bd/"
         }
         
-        # First fetch student_id from portfolios endpoint
         portfolios_url = "https://connect.bracu.ac.bd/api/mds/v1/portfolios"
         async with httpx.AsyncClient() as client:
             resp = await client.get(portfolios_url, headers=headers)
-            if resp.status_code == 401:  # Unauthorized - token might be invalid
+            if resp.status_code == 401:
                 logger.warning("Token unauthorized, attempting refresh")
-                # Clear the invalid token and try again with a fresh token
                 if session_id:
                     await redis_conn.delete(f"tokens:{session_id}")
                 return JSONResponse({"error": "Token expired, please refresh page"}, status_code=401)
@@ -682,29 +694,27 @@ async def raw_schedule(request: Request):
             
             student_id = data[0]["id"]
 
-            # Try to fetch the schedule
             schedule_url = f"https://connect.bracu.ac.bd/api/adv/v1/advising/sections/student/{student_id}/schedules"
             resp = await client.get(schedule_url, headers=headers)
             
             if resp.status_code == 200:
                 data = resp.json()
-                # Cache the successful response
                 await save_student_schedule(student_id, data)
-                return JSONResponse(data)
-            elif resp.status_code == 401:  # Unauthorized - token might be invalid
+                return JSONResponse({
+                    "cached": False,
+                    "data": ensure_old_format(data)
+                })
+            elif resp.status_code == 401:
                 logger.warning("Token unauthorized, attempting refresh")
-                # Clear the invalid token
                 if session_id:
                     await redis_conn.delete(f"tokens:{session_id}")
                 return JSONResponse({"error": "Token expired, please refresh page"}, status_code=401)
             else:
-                # On any error, try to return cached schedule
                 cached_schedule = await load_student_schedule(student_id)
                 if cached_schedule:
                     return JSONResponse({
                         "cached": True,
-                        "data": cached_schedule,
-                        "message": f"Using cached schedule due to API error: {resp.status_code}"
+                        "data": ensure_old_format(cached_schedule)
                     })
                 return JSONResponse({
                     "error": f"Failed to fetch schedule: {resp.text}",
