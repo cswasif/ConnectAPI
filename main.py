@@ -699,6 +699,12 @@ async def raw_schedule(request: Request):
             
             if resp.status_code == 200:
                 data = resp.json()
+                # Enrich each section with lab details if missing (use cache from connect.json)
+                for section in data:
+                    if not section.get("labSectionId"):
+                        cached_lab = lab_cache.get(section.get("sectionId"))
+                        if cached_lab:
+                            section.update(cached_lab)
                 await save_student_schedule(student_id, data)
                 return JSONResponse({
                     "cached": False,
@@ -739,4 +745,22 @@ async def global_exception_handler(request: Request, exc: Exception):
             error_code="UNHANDLED_ERROR",
             details={"message": str(exc)} if DEV_MODE else None
         ).dict()
-    ) 
+    )
+
+# Load lab details cache from connect.json at startup
+lab_cache = {}
+if os.path.exists('connect.json'):
+    with open('connect.json', 'r', encoding='utf-8') as f:
+        lab_cache_data = json.load(f)
+        if isinstance(lab_cache_data, dict) and 'data' in lab_cache_data:
+            lab_cache_data = lab_cache_data['data']
+    for entry in lab_cache_data:
+        if isinstance(entry, dict) and entry.get("labSectionId"):
+            lab_cache[entry["sectionId"]] = {
+                "labSectionId": entry.get("labSectionId"),
+                "labCourseCode": entry.get("labCourseCode"),
+                "labFaculties": entry.get("labFaculties"),
+                "labName": entry.get("labName"),
+                "labRoomName": entry.get("labRoomName"),
+                "labSchedules": entry.get("labSchedules"),
+            } 
